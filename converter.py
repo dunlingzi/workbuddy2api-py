@@ -22,6 +22,8 @@ workbuddy2api — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI 兼�
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import re
@@ -150,6 +152,98 @@ def _get_turing_device_token() -> str | None:
         return None
 
 
+def _maybe_decrypt_auth_file(raw: dict) -> dict | None:
+    """递归解密 auth JSON 中所有 $wbEncrypted:1 字段。若有变更返回新 dict，否则 None。"""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError as e:
+        raise RuntimeError("解密 auth 文件需要 cryptography 包，请安装 requirements.txt") from e
+
+    _at_rest_secret_key = "Sik9U5aXhCdwTVEwsEySDOmDoB9r9ntFxHF1fst9LQI="
+    _key = hashlib.sha256(_at_rest_secret_key.encode("utf-8")).digest()
+    _key_id = hashlib.sha256(_key).hexdigest()[:16]
+
+    def _lp(s: str) -> bytes:
+        b = s.encode("utf-8")
+        return len(b).to_bytes(4, "big") + b
+
+    def _build_aad(suite: int, key_id: str) -> bytes:
+        return (
+            b"WB-AAD\0"
+            + b"\x01"
+            + _lp("WBEV1")
+            + _lp("sym-v1")
+            + suite.to_bytes(4, "big")
+            + _lp(key_id)
+            + b"\x02"
+            + b"\x00"
+            + b"\x00"
+        )
+
+    def _unwrap(value):
+        if (
+            isinstance(value, dict)
+            and value.get("type") == "Buffer"
+            and isinstance(value.get("data"), list)
+        ):
+            return bytes(value["data"]).decode("utf-8")
+        if isinstance(value, dict):
+            return {k: _unwrap(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [_unwrap(v) for v in value]
+        return value
+
+    def _maybe_json(s: str):
+        try:
+            return json.loads(s)
+        except json.JSONDecodeError:
+            return s
+
+    def _decrypt_field(envelope_b64: str):
+        env = json.loads(base64.b64decode(envelope_b64).decode("utf-8"))
+        if env.get("keyId") != _key_id:
+            raise RuntimeError(f"auth 文件 envelope keyId 不匹配：{env.get('keyId')}")
+        nonce = base64.b64decode(env["nonce"])
+        tag = base64.b64decode(env["authTag"])
+        ct = base64.b64decode(env["ciphertext"])
+        aad = _build_aad(env["suite"], env["keyId"])
+        plaintext = AESGCM(_key).decrypt(nonce, ct + tag, aad)
+        v = _maybe_json(plaintext.decode("utf-8"))
+        v = _unwrap(v)
+        if isinstance(v, str):
+            return _maybe_json(v)
+        return v
+
+    def _walk(value):
+        if isinstance(value, dict):
+            if value.get("$wbEncrypted") == 1 and isinstance(value.get("envelope"), str):
+                return (_decrypt_field(value["envelope"]), True)
+            new_dict: dict = {}
+            changed = False
+            for k, v in value.items():
+                nv, c = _walk(v)
+                new_dict[k] = nv
+                changed = changed or c
+            return (new_dict, changed)
+        if isinstance(value, list):
+            new_list: list = []
+            changed = False
+            for v in value:
+                nv, c = _walk(v)
+                new_list.append(nv)
+                changed = changed or c
+            return (new_list, changed)
+        return (value, False)
+
+    new_raw: dict = {}
+    changed = False
+    for k, v in raw.items():
+        nv, c = _walk(v)
+        new_raw[k] = nv
+        changed = changed or c
+    return new_raw if changed else None
+
+
 class CredentialManager:
     """从 auth 文件读取凭据；token 临近过期时自动刷新并回写。"""
 
@@ -158,10 +252,24 @@ class CredentialManager:
         self._lock = threading.Lock()
         self._cached: dict | None = None
         self._mtime: float = 0.0
+        try:
+            self._cached = self._read_decrypted()
+            self._mtime = self.path.stat().st_mtime
+        except (OSError, json.JSONDecodeError) as e:
+            _log(f"读取 auth 文件失败：{e}")
 
     def _read_raw(self) -> dict:
         with open(self.path, "r", encoding="utf-8") as f:
             return json.load(f)
+
+    def _read_decrypted(self) -> dict:
+        """读取 auth 文件；若含加密字段则解密后返回，不修改原文件。"""
+        raw = self._read_raw()
+        decrypted = _maybe_decrypt_auth_file(raw)
+        if decrypted is None:
+            return raw
+        _log("解密 auth 文件中的加密字段")
+        return decrypted
 
     def _load_if_stale(self):
         """若文件 mtime 变了（外部刷新过），重新加载缓存。"""
@@ -170,8 +278,11 @@ class CredentialManager:
         except OSError:
             return
         if self._cached is None or mt != self._mtime:
-            self._cached = self._read_raw()
-            self._mtime = mt
+            try:
+                self._cached = self._read_decrypted()
+                self._mtime = self.path.stat().st_mtime
+            except (OSError, json.JSONDecodeError) as e:
+                _log(f"读取 auth 文件失败：{e}")
 
     def _session(self) -> dict:
         self._load_if_stale()

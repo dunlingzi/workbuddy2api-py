@@ -17,6 +17,7 @@ from admin.config import settings
 from admin.db import SessionLocal, get_db
 from admin.models import Account, AccountModelCooldown, ModelConfig, UsageLog
 from admin.security import require_admin
+import wb_credential_crypto
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
@@ -199,6 +200,21 @@ def _client_auth_dir() -> str:
     return os.path.expandvars(d)
 
 
+def _safe_name(raw) -> str | None:
+    """账号名入库前清洗：超过 VARCHAR(120) 的一律丢弃。
+
+    新版桌面端的 nickname 是 {"$wbEncrypted":1,...} 加密对象，前端序列化后
+    是几百字符长串，原样入库会 1406（Data too long）让整个批量导入 500。
+    丢弃后由 _apply_meta 用 uid 兜底，比塞一个垃圾名强。
+    """
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    if not raw or len(raw) > 120:
+        return None
+    return raw
+
+
 def _apply_meta(acc: Account, auth_json: str, profile: dict | None = None,
                 balance: dict | None = None):
     """把凭证里的元信息落到账号记录上。
@@ -210,6 +226,9 @@ def _apply_meta(acc: Account, auth_json: str, profile: dict | None = None,
     `balance` 是验证阶段顺带拿到的真实余额，直接写库，
     不用再补一次 `fetch_balance()`（同一个请求打两遍纯属浪费）。
     """
+    # WorkBuddy 5.6.x 的 .info 敏感字段是本地密文：入库前解成明文形态，
+    # 下游（token 刷新 / 鉴权头 / 昵称显示）才能按原行为工作。无静态钥时原样保留。
+    auth_json = wb_credential_crypto.ensure_plain_auth(auth_json)
     meta = backend.parse_auth_meta(auth_json)
     prof = profile or {}
     acc.auth_json = auth_json
@@ -227,7 +246,8 @@ def _apply_meta(acc: Account, auth_json: str, profile: dict | None = None,
         acc.balance_remain = int(balance.get("remain") or 0)
         acc.last_sync_at = datetime.utcnow()
     # 号池名称：上游真实昵称 → 上游手机号 → 凭证昵称 → uid
-    # （昵称为 null/空串/"null" 一律视为缺失）
+    # （昵称为 null/空串/"null" 一律视为缺失；非字符串（如密文对象）
+    # 已由 parse_auth_meta 归空，这里 _clean 再兜一道）
     def _clean(v) -> str:
         s = (v if isinstance(v, str) else "").strip()
         return "" if s.lower() in ("null", "none") else s
@@ -564,26 +584,30 @@ def clear_model_limit(acc_id: int, body: ClearModelLimit,
 
 @router.post("")
 def add_account(body: AccountIn, _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    # 第零道：5.6.x 客户端会把 .info 敏感字段本地加密（accessToken/refreshToken
+    # 是密文对象），不解开的话下面两道校验都会误杀真凭证。幂等：明文原样返回。
+    auth_json = wb_credential_crypto.ensure_plain_auth(body.auth_json)
     # 第一道：只收「auth 之后的授权 JSON」，非凭证一律 400
-    _reject_non_credential(body.auth_json)
+    _reject_non_credential(auth_json)
     # 第二道：**真调上游**确认凭证可用、非伪造，并取回真实账号信息 + 余额
-    profile, balance = _verify_credential_live_or_400(body.auth_json)
+    profile, balance = _verify_credential_live_or_400(auth_json)
 
     # 按 uid 去重：同一个人重复添加只会产生垃圾记录，
     # 而且会让批量任务对同一个号跑多次（白等、看起来像卡住）
-    dup = _find_dup(db, body.auth_json)
+    dup = _find_dup(db, auth_json)
     if dup:
         # 重复上传 = 用新凭证覆盖 + 刷新余额（原来直接 return，
         # 于是重传一份新凭证后列表还显示旧余额，看起来「没生效」）
-        dup.auth_json = body.auth_json
-        _apply_meta(dup, body.auth_json, profile=profile, balance=balance)
+        dup.auth_json = auth_json
+        _apply_meta(dup, auth_json, profile=profile, balance=balance)
         db.commit()
         _post_login_automation(dup.id, dup.name or dup.uid)
         return {"id": dup.id, "name": dup.name, "ok": True,
                 "duplicated": True,
                 "message": f"该账号已存在（id={dup.id}），已用新凭证覆盖更新"}
-    acc = Account(name=body.name) if body.name else Account()
-    _apply_meta(acc, body.auth_json, profile=profile, balance=balance)
+    clean = _safe_name(body.name)
+    acc = Account(name=clean) if clean else Account()
+    _apply_meta(acc, auth_json, profile=profile, balance=balance)
     db.add(acc)
     db.commit()
     db.refresh(acc)
@@ -612,8 +636,11 @@ def batch_add(body: AccountBatchIn, _: bool = Depends(require_admin), db: Sessio
     for it in body.items:
         if not it.auth_json or not it.auth_json.strip():
             continue
+        # 第零道：5.6.x 密文 .info 先解密（幂等），否则校验会误杀真凭证；
+        # 入库也统一存明文形态（与单条上传同口径）。
+        auth_json = wb_credential_crypto.ensure_plain_auth(it.auth_json)
         # 第一道：非凭证拒收（与单条上传、与手机号登录共用同一校验器）
-        chk = wb_login.validate_credential(it.auth_json)
+        chk = wb_login.validate_credential(auth_json)
         if not chk.ok:
             errors.append(f"跳过一条：不是有效的客户端凭证（{chk.reason}）")
             continue
@@ -622,7 +649,7 @@ def batch_add(body: AccountBatchIn, _: bool = Depends(require_admin), db: Sessio
         profile: dict = {}
         balance: dict = {}
         if body.verify:
-            probe = wb_login.probe_credential_live(it.auth_json)
+            probe = wb_login.probe_credential_live(auth_json)
             if not probe.ok:
                 errors.append(f"跳过一条：未通过上游验证（{probe.message}）")
                 continue
@@ -630,17 +657,18 @@ def batch_add(body: AccountBatchIn, _: bool = Depends(require_admin), db: Sessio
             balance = probe.balance or {}
 
         # uid 以上游返回的真实值为准（挡「真令牌 + 假 uid」）
-        uid = str(profile.get("uid") or _uid_of(it.auth_json) or "")
+        uid = str(profile.get("uid") or _uid_of(auth_json) or "")
         if uid and uid in seen:
             # 已存在 -> 覆盖新凭证并刷新余额（与单条上传同口径）
             old = seen[uid]
-            old.auth_json = it.auth_json
-            _apply_meta(old, it.auth_json, profile=profile, balance=balance)
+            old.auth_json = auth_json
+            _apply_meta(old, auth_json, profile=profile, balance=balance)
             db.commit()
             skipped += 1
             continue
-        acc = Account(name=it.name) if it.name else Account()
-        _apply_meta(acc, it.auth_json, profile=profile, balance=balance)
+        clean = _safe_name(it.name)
+        acc = Account(name=clean) if clean else Account()
+        _apply_meta(acc, auth_json, profile=profile, balance=balance)
         db.add(acc)
         db.commit()
         db.refresh(acc)
@@ -791,6 +819,9 @@ def import_local(body: ImportLocalIn, _: bool = Depends(require_admin), db: Sess
         except Exception:
             errors.append(f"{name}: 读取失败")
             continue
+        # 5.6.x 密文 .info 先解密（幂等），否则校验会误杀本机真凭证；
+        # 入库存明文形态，与其他入口同口径。
+        auth = wb_credential_crypto.ensure_plain_auth(auth)
         # 目录里的 *.info 未必都是凭证（可能有半截文件 / 别的 JSON），
         # 与上传入口用同一个校验器把关，避免把垃圾读进号池。
         chk = wb_login.validate_credential(auth)

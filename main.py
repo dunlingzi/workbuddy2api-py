@@ -268,10 +268,15 @@ def _remove_pidfile() -> None:
 
 
 def _kill_children(procs: list) -> None:
-    """结束所有子进程（含其进程组），确保不留孤儿占着端口。"""
+    """结束所有子进程（含其子进程/进程组），确保不留孤儿占着端口。"""
     for _tag, p in procs:
         try:
             if p.poll() is not None:
+                continue
+            if os.name == "nt":
+                # Windows：p 是 venv 的 python 启动器（只是壳，真正的 uvicorn 是它的
+                # 子进程），terminate() 只杀壳会留下仍占着端口的孤儿 —— 必须整树结束。
+                _terminate_tree(p.pid)
                 continue
             # 子进程以 start_new_session=True 启动，自成进程组 → 整组结束
             try:
@@ -770,6 +775,17 @@ def main() -> None:
 
     def _launch(tag: str, cmd: list[str], port: int, host: str, logfile: Path) -> None:
         _log(f"[main] 启动 {tag} (http://{host}:{port}) : {' '.join(cmd)}")
+        # 子进程启动细节：
+        #   * POSIX：start_new_session 自成进程组，停止时整组结束；
+        #   * Windows：start_new_session 会被忽略（subprocess 的 Windows 分支不用它），
+        #     必须显式 CREATE_NO_WINDOW —— 否则当本进程没有控制台时（隐藏窗口 /
+        #     任务计划等方式启动），Windows 会给子进程**新开一个可见的黑窗**，
+        #     用户关掉那个窗口就会连带杀掉 uvicorn（端口失联）。
+        popen_kw: dict = {}
+        if os.name == "nt":
+            popen_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+        else:
+            popen_kw["start_new_session"] = True
         # 交互式终端才用「管道 + 转发线程」以便边跑边看；
         # **后台/服务方式则让子进程直接写日志文件**。
         #
@@ -787,8 +803,8 @@ def main() -> None:
             p = subprocess.Popen(
                 cmd, cwd=str(ROOT),
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                start_new_session=True,
                 text=True, bufsize=1, env=os.environ.copy(),
+                **popen_kw,
             )
             threading.Thread(target=_pump, args=(p.stdout, logfile, tag),
                              daemon=True).start()
@@ -798,8 +814,8 @@ def main() -> None:
             p = subprocess.Popen(
                 cmd, cwd=str(ROOT),
                 stdout=fh, stderr=subprocess.STDOUT,
-                start_new_session=True,
                 text=True, bufsize=1, env=os.environ.copy(),
+                **popen_kw,
             )
         procs.append((tag, p))
 

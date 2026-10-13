@@ -4,6 +4,7 @@ import re
 import time
 
 from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from admin.config import settings
@@ -45,20 +46,21 @@ def get_db():
 
 
 def ensure_database():
-    """若 DATABASE_URL 指向的库不存在则创建（仅 MySQL）。"""
+    """若 DATABASE_URL 指向的库不存在则创建（仅 MySQL）。
+
+    URL 解析必须走 make_url：密码含 @ % # 等特殊字符时在 URL 里是百分号编码
+    （如 `@` -> `%40`），手工 split 不解码会把编码串当密码发给 MySQL（1045）。
+    """
     url = settings.DATABASE_URL
     if not url.startswith("mysql"):
         return
-    db_name = url.split("/")[-1].split("?")[0]
-    rest = url.split("://", 1)[1]
-    user_pass, host_rest = rest.split("@", 1)
-    user, pwd = (user_pass.split(":", 1) + [""])[:2] if ":" in user_pass else (user_pass, "")
-    host_port = host_rest.split("/", 1)[0]
-    host = host_port.split(":")[0]
-    port = int(host_port.split(":")[1]) if ":" in host_port else 3306
+    u = make_url(url)
+    db_name = (u.database or "").split("?")[0]
     import pymysql
 
-    conn = pymysql.connect(host=host, port=port, user=user, password=pwd, charset="utf8mb4")
+    conn = pymysql.connect(host=u.host, port=u.port or 3306,
+                           user=u.username or "", password=u.password or "",
+                           charset="utf8mb4")
     try:
         with conn.cursor() as cur:
             cur.execute(f"CREATE DATABASE IF NOT EXISTS `{_quote_db_name(db_name)}` CHARACTER SET utf8mb4")

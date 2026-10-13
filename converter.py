@@ -32,6 +32,8 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+
+import wb_credential_crypto
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
@@ -251,7 +253,10 @@ class CredentialManager:
 
     def _read_raw(self) -> dict:
         with open(self.path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            raw = f.read()
+        # WorkBuddy 5.6.x 每次登录都会把 .info 覆盖成密文形态，读取时兜底解密（幂等）
+        plain = wb_credential_crypto.ensure_plain_auth(raw)
+        return json.loads(plain)
 
     def _load_if_stale(self):
         """若文件 mtime 变了（外部刷新过），重新加载缓存。"""

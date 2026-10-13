@@ -123,28 +123,27 @@ def _extract_system_text(system) -> str:
     return ""
 
 
-def _image_block_to_chat_part(block: dict) -> dict:
-    """Preserve Anthropic base64/URL images; reject invalid sources instead of losing them."""
-    source = block.get("source")
-    if not isinstance(source, dict):
-        raise ValueError("image.source must be an object")
-    source_type = source.get("type")
-    if source_type == "base64":
-        media = source.get("media_type") or "image/png"
-        data = source.get("data")
-        if not isinstance(media, str) or not media.strip().startswith("image/"):
-            raise ValueError("image.source.media_type must be an image MIME type")
-        if not isinstance(data, str) or not data.strip():
-            raise ValueError("image.source.data must be a nonempty base64 string")
-        url = f"data:{media.strip()};base64,{data.strip()}"
-    elif source_type == "url":
-        url = source.get("url")
-        if not isinstance(url, str) or not url.strip():
-            raise ValueError("image.source.url must be a nonempty string")
-        url = url.strip()
-    else:
-        raise ValueError("image.source.type must be base64 or url")
-    return {"type": "image_url", "image_url": {"url": url}}
+def _image_block_to_part(block: dict) -> dict | None:
+    """Anthropic image block → OpenAI image_url 内容部件。无法转换返回 None。
+
+    Anthropic: {"type": "image", "source": {"type": "base64",
+               "media_type": "image/png", "data": "<base64>"}}
+               或 source.type == "url"
+    OpenAI:    {"type": "image_url", "image_url": {"url": "data:image/png;base64,<...>"}}
+    """
+    src = block.get("source")
+    if not isinstance(src, dict):
+        return None
+    if src.get("type") == "base64":
+        media = str(src.get("media_type") or "image/png")
+        data = src.get("data") or ""
+        if data:
+            return {"type": "image_url", "image_url": {"url": f"data:{media};base64,{data}"}}
+    elif src.get("type") == "url":
+        url = src.get("url") or ""
+        if url:
+            return {"type": "image_url", "image_url": {"url": url}}
+    return None
 
 
 def _convert_anthropic_message(msg: dict) -> list[dict]:
@@ -166,29 +165,49 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     # 检查是否包含 tool_result（role=user 时）
     if role == "user":
         result: list[dict] = []
-        content_parts: list[dict] = []
-        has_images = False
+        parts: list[dict] = []  # OpenAI content parts（text + image_url）
         for block in blocks:
             if not isinstance(block, dict):
                 continue
             bt = block.get("type", "")
             if bt == "text":
-                content_parts.append({"type": "text", "text": block.get("text", "")})
+                t = block.get("text", "")
+                if t:
+                    parts.append({"type": "text", "text": t})
             elif bt == "image":
-                content_parts.append(_image_block_to_chat_part(block))
-                has_images = True
+                part = _image_block_to_part(block)
+                if part:
+                    parts.append(part)
             elif bt == "tool_result":
                 # tool_result → 独立的 tool 消息
                 tc_id = block.get("tool_use_id", "")
                 output = block.get("content", "")
+                tool_images: list[dict] = []
                 if isinstance(output, list):
-                    output = "".join(
-                        b.get("text", "") for b in output if isinstance(b, dict) and b.get("type") == "text"
-                    )
+                    texts = []
+                    for b in output:
+                        if not isinstance(b, dict):
+                            continue
+                        if b.get("type") == "text":
+                            texts.append(b.get("text", ""))
+                        elif b.get("type") == "image":
+                            # OpenAI 的 tool 消息只收纯文本，图片挪进 user 消息
+                            p = _image_block_to_part(b)
+                            if p:
+                                tool_images.append(p)
+                    output = "".join(texts)
                 result.append({"role": "tool", "tool_call_id": tc_id, "content": output})
-        if content_parts:
-            content = content_parts if has_images else "".join(part["text"] for part in content_parts)
-            result.insert(0, {"role": "user", "content": content})
+                parts.extend(tool_images)
+        if parts:
+            # 纯文本保持 string content；带图片时用 parts 数组。
+            # 注意：user 内容必须放在 tool 消息**之后** —— OpenAI 协议要求
+            # tool 结果紧跟 assistant 的 tool_calls，中间插入 user 消息会被
+            # 上游判为 11148 "tool calls and tool results do not match"。
+            if all(p.get("type") == "text" for p in parts):
+                user_content: Any = "".join(p["text"] for p in parts)
+            else:
+                user_content = parts
+            result.append({"role": "user", "content": user_content})
         return result
 
     # assistant 角色

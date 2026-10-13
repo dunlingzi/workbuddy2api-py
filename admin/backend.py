@@ -15,6 +15,8 @@ from pathlib import Path
 
 import httpx
 
+import wb_credential_crypto
+
 from converter import BACKEND, CredentialManager  # 复用既有后端鉴权 / 刷新 / 模型 / 额度逻辑
 
 #: 项目根加入 sys.path，便于导入根目录的 wb_install（与 converter 同级）。
@@ -197,8 +199,20 @@ def stable_device_id(uid: str, salt: str) -> str:
 
 
 
+def _plain_nick(v) -> str:
+    """昵称字段安全化。
+
+    新版桌面端的 nickname 可能是 {"$wbEncrypted":1,"envelope":...} 加密对象
+    （本地无法解密）。str() 会产出几百字符的长串，入库会撑爆 VARCHAR(120)（1406），
+    写进任务摘要也会污染显示，所以非字符串一律视为缺失。
+    """
+    return v if isinstance(v, str) else ""
+
+
 def parse_auth_meta(auth_json: str) -> dict:
     """从 .info 原文里抽取账号元信息（uid / enterpriseId / domain / 昵称）。"""
+    # 5.6.x 密文字段兜底解密（幂等）：让「扫描本机」等只读场景也能拿到明文昵称。
+    auth_json = wb_credential_crypto.ensure_plain_auth(auth_json)
     try:
         data = json.loads(auth_json)
     except Exception:
@@ -209,7 +223,7 @@ def parse_auth_meta(auth_json: str) -> dict:
         "uid": str(acct.get("uid") or ""),
         "enterprise_id": str(acct.get("enterpriseId") or ""),
         "domain": str(auth.get("domain") or ""),
-        "nickname": str(acct.get("nickname") or ""),
+        "nickname": _plain_nick(acct.get("nickname")),
     }
 
 
@@ -719,7 +733,7 @@ class AccountSession:
         return str(self._sess_acct().get("uid") or "")
 
     def _nick(self) -> str:
-        return str(self._sess_acct().get("nickname") or "")
+        return _plain_nick(self._sess_acct().get("nickname"))
 
     def _domain(self) -> str:
         return self._sess_auth().get("domain") or "copilot.tencent.com"

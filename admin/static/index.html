@@ -3603,7 +3603,13 @@ async function submitUpload(){
   }
 
   if(!allItems.length){ toast("未解析出任何账号凭证","err"); return; }
-  const body = { items: allItems.map(x => ({ name: x.account?.nickname || x.name || "", auth_json: JSON.stringify(x) })) };
+  // 新版客户端的 account.nickname 可能是 {"$wbEncrypted":1,...} 加密对象（非字符串），
+  // 序列化后是几百字符长串，入库会撑爆 name 列导致整个批量导入 500 —— 只透传字符串昵称。
+  const body = { items: allItems.map(x => {
+      const n = x.account?.nickname;
+      const name = (typeof n === "string" && n && n.toLowerCase() !== "null") ? n : (x.name || "");
+      return { name: String(name).slice(0, 120), auth_json: JSON.stringify(x) };
+  }) };
   const r = await api("/api/accounts/batch",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   const d = await r.json().catch(()=>({}));
   if(r.ok){

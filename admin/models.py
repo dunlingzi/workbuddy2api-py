@@ -35,6 +35,8 @@ class Account(Base):
     cool_kind = Column(String(16), default="")       # hard_credit | soft_rate | error_threshold | not_found
     last_err_at = Column(DateTime, nullable=True)
     last_err_msg = Column(String(255), default="")
+    last_upstream_error = Column(Text, default="")
+    selection_priority = Column(Integer, nullable=True, default=None)
     last_picked_at = Column(DateTime, nullable=True)  # 最近一次被选中（仅观测；防撞号窗口已移入进程内存）
     # 熔断：连续失败达阈值后指数退避，封顶 breaker_cooldown_max。
     # 与 cool_until 是**或门**关系（任一未到期即不可选），生效的是更晚的那个。
@@ -94,6 +96,8 @@ class AccountModelCooldown(Base):
     until = Column(DateTime, nullable=True)          # 冷却截止
     kind = Column(String(24), default="")            # model_daily | model_rate | model_queue | model_block
     reason = Column(String(255), default="")
+    upstream_error = Column(Text, default="")
+    reset_source = Column(String(24), default="")
     hits = Column(Integer, default=0)                # 命中次数（model_block 指数退避用）
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -102,6 +106,7 @@ class ApiKey(Base):
     """对外共享的 API Key，带积分限额。"""
 
     __tablename__ = "api_keys"
+    __table_args__ = (Index("ux_api_keys_account", "account_id", unique=True),)
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(120), default="")
@@ -111,10 +116,15 @@ class ApiKey(Base):
     credit_limit = Column(Float, default=0)  # 限额（credits）；unlimited=True 时忽略
     credit_used = Column(Float, default=0)
     unlimited = Column(Integer, default=0)  # 0/1
+    # 该 Key 并发上限：NULL=跟随全局 ADMIN_GATEWAY_MAX_CONCURRENT；0=不限；N=最多 N 路在途
+    # 注意：这是准入层限制，与账号层 ADMIN_POOL_MAX_IN_FLIGHT（防单号雪崩）相互独立。
+    max_concurrent = Column(Integer, nullable=True, default=None)
     status = Column(String(16), default="active")  # active | revoked
     note = Column(String(255), default="")
     # 绑定的模型分组 id；0 = 未绑定（可用全部启用模型）。分组被删时按 0 处理（自动降级）
     group_id = Column(Integer, default=0)
+    # NULL = public pool; a reservation survives revocation until explicitly released.
+    account_id = Column(Integer, nullable=True, default=None)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -182,6 +192,7 @@ class UsageLog(Base):
     client_ip = Column(String(64), default="")
     # 用途标识（透传给上游的 X-Agent-Purpose），便于风控审计与上游请求用量对齐
     use_case = Column(String(64), default="")
+    reasoning_effort = Column(String(32), default="")  # Requested effort; empty means model default.
     # 请求级表格日志字段（ logging）：TTFB / 总耗时 / 序号 / 错误分类
     seq = Column(Integer, default=0)
     ttfb_ms = Column(Integer, nullable=True, default=None)
@@ -204,6 +215,19 @@ class ModelConfig(Base):
     credits_raw = Column(String(120), default="")  # 原始 credits 字符串（如 "x0.05" / "x0.00 credits"）
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class GrowthPlanRecord(Base):
+    """成长巡检/手动领奖的逐账号持久记录，不存凭证或上游原始响应。"""
+    __tablename__ = "growth_plan_records"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, nullable=False, index=True)
+    source = Column(String(24), default="schedule")
+    action = Column(String(40), default="巡检")
+    ok = Column(Integer, default=1)
+    credit = Column(Integer, default=0)
+    result_json = Column(Text, default="{}")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
 class SystemSetting(Base):

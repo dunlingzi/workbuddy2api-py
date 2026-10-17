@@ -47,7 +47,7 @@ router = APIRouter(prefix="/api/login", tags=["login"])
 #: 自助注册用的公开路由（不需要后台登录态、也不需要邀请码）。
 public_router = APIRouter(tags=["join"])
 
-#: 同一**手机号**两次发码的最小间隔（秒）。防对同一个号短信轰炸。
+#: 同一出口 IP、同一手机号两次发码的最小间隔（秒）。
 SMS_MIN_INTERVAL = 60
 #: 同一 IP 每小时最多发码次数（防有人拿我们的出口 IP 刷短信）。
 SMS_MAX_PER_HOUR = 10
@@ -56,31 +56,43 @@ SMS_MAX_PER_HOUR = 10
 #:   ip -> [时间戳...]        按小时封顶
 #:   mobile -> 上次发码时间戳  按号码 60s 间隔
 #:
-#: 为什么间隔要绑**手机号**而不是 IP：朋友之间经常共用出口（公司/校园 NAT、
-#: 家庭 Wi-Fi、手机运营商 CGNAT）。若按 IP 做 60s 间隔，第二个人会被第一个
-#: 人挡掉 —— 而他们要登录的其实是不同的号。按号码限间隔既能挡住对同号的轰炸，
-#: 又不会误伤共用网络的多人。IP 维度只留一个宽松的小时上限兜底。
+# The upstream observes our shared egress IP, including failed requests.
 _sms_log: dict[str, list[float]] = {}
 _sms_mobile_last: dict[str, float] = {}
 #: FastAPI 的同步端点跑在线程池里，节流表会被并发读写 —— 必须加锁。
 _sms_lock = threading.Lock()
+_sms_exit_last = 0.0
+_sms_exit_blocked_until = 0.0
+_sms_exit_hits: list[float] = []
 
 
 def _check_sms_quota(ip: str, mobile: str = "") -> None:
     """发码节流。超限直接 429。
 
     * `mobile` 非空时按号码限 60 秒间隔；
-    * 任意情况下按 IP 限每小时 `SMS_MAX_PER_HOUR` 次。
+    * 所有客户端共用出口的最小间隔和每小时上限，失败请求也占配额；
+    * 任意情况下按客户端 IP 限每小时 `SMS_MAX_PER_HOUR` 次。
     """
+    global _sms_exit_last
     now = time.time()
     with _sms_lock:
+        _sms_exit_hits[:] = [stamp for stamp in _sms_exit_hits if now - stamp < 3600]
+        if len(_sms_exit_hits) >= SMS_MAX_PER_HOUR:
+            wait = max(1, int(3600 - (now - _sms_exit_hits[0])) + 1)
+            raise HTTPException(429, "短信出口本小时配额已用完，请稍后重试", headers={"Retry-After": str(wait)})
+        wait = max(_sms_exit_last + SMS_MIN_INTERVAL, _sms_exit_blocked_until) - now
+        if wait > 0:
+            seconds = int(wait) + 1
+            raise HTTPException(429, detail=f"短信出口保护中，请 {seconds} 秒后再试",
+                                headers={"Retry-After": str(seconds)})
         if mobile:
             last = _sms_mobile_last.get(mobile, 0.0)
             if last and (now - last) < SMS_MIN_INTERVAL:
                 wait = int(SMS_MIN_INTERVAL - (now - last)) + 1
                 raise HTTPException(
                     status_code=429,
-                    detail=f"该手机号发送过于频繁，请 {wait} 秒后再试")
+                    detail=f"该手机号发送过于频繁，请 {wait} 秒后再试",
+                    headers={"Retry-After": str(wait)})
 
         hits = [t for t in _sms_log.get(ip, []) if now - t < 3600]
         if len(hits) >= SMS_MAX_PER_HOUR:
@@ -90,17 +102,14 @@ def _check_sms_quota(ip: str, mobile: str = "") -> None:
         _sms_log[ip] = hits
         if mobile:
             _sms_mobile_last[mobile] = now
-
-
-def _refund_sms_quota(ip: str, mobile: str = "") -> None:
-    """发码失败时归还配额 —— 否则用户手滑几次就被自己锁死。"""
-    with _sms_lock:
-        hits = _sms_log.get(ip) or []
-        if hits:
-            hits.pop()
-            _sms_log[ip] = hits
-        if mobile:
-            _sms_mobile_last.pop(mobile, None)
+        _sms_exit_last = now
+        _sms_exit_hits.append(now)
+        for key in list(_sms_log):
+            if not any(now - stamp < 3600 for stamp in _sms_log[key]):
+                del _sms_log[key]
+        for key, stamp in list(_sms_mobile_last.items()):
+            if now - stamp > 3600:
+                del _sms_mobile_last[key]
 
 
 class StartOut(BaseModel):
@@ -111,6 +120,7 @@ class StartOut(BaseModel):
 class SendIn(BaseModel):
     sid: str
     mobile: str
+    country_code: str = "86"
 
 
 class VerifyIn(BaseModel):
@@ -339,15 +349,37 @@ def login_send(body: SendIn, request: Request, _: bool = Depends(require_admin))
     """第 2 步：给指定手机号发验证码。"""
     ip = get_client_ip(request.headers.get("x-forwarded-for"), request.client.host
                        if request.client else None)
-    mobile = wb_login.normalize_mobile(body.mobile)
-    _check_sms_quota(ip, mobile)
+    return _send_guarded(body, ip)
+
+
+def _send_guarded(body, ip):
+    global _sms_exit_blocked_until
     try:
+        mobile = wb_login.normalize_mobile(body.mobile, body.country_code)
         sess = wb_login.get_session(body.sid)
-        out = wb_login.send_sms(sess, body.mobile)
-    except wb_login.WbLoginError as e:
-        _refund_sms_quota(ip, mobile)
-        raise _fail(e, 502)
-    return {"ok": True, "expires_in": out.get("expires_in", 60)}
+        with _upstream_slot("send"), sess.lock:
+            if sess.consumed or sess.expired():
+                raise wb_login.WbLoginError("会话已失效", step="session")
+            if sess.sms_state_token and (sess.mobile != mobile or sess.country_code != body.country_code.lstrip("+")):
+                raise wb_login.WbLoginError("请先完成当前手机号的验证码验证", step="mobile")
+            _check_sms_quota(ip, body.country_code + ":" + mobile)
+            # An upstream failure or timeout may still have sent an SMS. Keep the quota.
+            try:
+                out = wb_login.send_sms(sess, mobile, body.country_code)
+            except wb_login.WbLoginError as error:
+                if error.reason == "need_captcha" or any(word in error.message.lower() for word in ("频繁", "限制", "rate", "频率")):
+                    with _sms_lock:
+                        _sms_exit_blocked_until = time.time() + 300
+                raise
+    except wb_login.WbLoginError as error:
+        response = _fail(error, 400 if error.step in ("mobile", "session") else 502)
+        if error.step == "sms_send":
+            response.headers = {"Retry-After": str(max(SMS_MIN_INTERVAL, int(_sms_exit_blocked_until - time.time()) + 1))}
+        raise response
+    except wb_login.httpx.RequestError:
+        raise HTTPException(502, detail={"message": "短信发送结果未知，请稍后再试", "step": "sms_send"},
+                            headers={"Retry-After": str(SMS_MIN_INTERVAL)}) from None
+    return {"ok": True, "expires_in": out.get("expires_in", 60), "retry_after": SMS_MIN_INTERVAL}
 
 
 @router.post("/verify")
@@ -388,9 +420,17 @@ def login_status(sid: str, _: bool = Depends(require_admin)):
     return {
         "alive": True,
         "mobile": sess.mobile,
+        "country_code": sess.country_code,
         "code_sent": bool(sess.sms_state_token),
+        "consumed": sess.consumed,
+        "retry_after": max(0, int(sess.code_sent_at + SMS_MIN_INTERVAL - time.time()) + 1),
         "age": int(time.time() - sess.created),
     }
+
+
+@public_router.get("/api/join/status/{sid}")
+def join_status(sid: str):
+    return login_status(sid, True)
 
 
 # ===========================================================================
@@ -418,6 +458,7 @@ class JoinIn(BaseModel):
     """
     sid: Optional[str] = ""
     mobile: str = ""
+    country_code: str = "86"
     sms_code: str = ""
 
 
@@ -457,23 +498,7 @@ def _mask_name(name: str) -> str:
 #: 登录后自动做的事（都做成可开关，便于按需关掉）
 POST_LOGIN_AUTOMATION = True
 
-#: 同时允许在跑的「登录后收尾」线程数。
-#:
-#: 为什么必须限流：一次收尾要跑约 5 分钟（15 个任务 + 猫猫旅行 + 签到），
-#: 期间一直在打上游。如果不限制，注册洪峰（比如 50 人同时注册）就会拉起
-#: 50 个这样的线程 —— 那正是我们刚给登录链路加闸门要避免的情况，
-#: 只不过换成了后台线程，照样能把上游打爆、把本机 CPU/内存吃满。
-#:
-#: 取 2：收尾是「锦上添花」，慢一点没关系；超出的**直接跳过**
-#: （账号已入库、功能正常，只是这次不自动做任务，等每天的定时任务兜底）。
-MAX_POST_LOGIN_WORKERS = 2
-
-#: 当前在跑的收尾线程数
-_post_login_active = 0
-_post_login_lock = threading.Lock()
-
-
-def _run_post_login_automation(account_id: int, name: str) -> None:
+def _run_post_login_automation(account_id: int, name: str) -> dict:
     """后台线程：对一个刚入库的账号做成长任务 + 猫猫旅行 + 签到。
 
     每一步都独立 try：任一环节失败不影响其它环节，也绝不影响登录结果。
@@ -483,11 +508,12 @@ def _run_post_login_automation(account_id: int, name: str) -> None:
     from admin import backend
 
     log = logging.getLogger("admin.wb_login_router")
+    result = {"errors": [], "pet_credits": 0, "growth_credits": 0, "checkin_credits": 0}
     db = SessionLocal()
     try:
         acc = db.query(Account).filter(Account.id == account_id).first()
         if not acc:
-            return
+            return {"errors": ["账号不存在"]}
         log.info("wb_login: 登录后收尾开始 id=%s name=%s", account_id, name)
         _t0 = _t.time()
 
@@ -497,9 +523,14 @@ def _run_post_login_automation(account_id: int, name: str) -> None:
                 res = sess.run_cat_travel()
                 acc.auth_json = sess.updated_json()
                 db.commit()
+            result["pet_credits"] = res.get("credits") or 0
+            if not res.get("ok") or res.get("outcome") == "gate_blocked":
+                result["errors"].append("宠物领养或旅行未完成")
             log.info("wb_login: 收尾-猫猫旅行 id=%s outcome=%s credits=%s",
                      account_id, res.get("outcome"), res.get("credits"))
         except Exception as e:
+            db.rollback()
+            result["errors"].append("宠物任务失败")
             log.warning("wb_login: 收尾-猫猫旅行失败 id=%s: %s", account_id, e)
 
         # ---- 2) 每日签到 ----
@@ -508,11 +539,14 @@ def _run_post_login_automation(account_id: int, name: str) -> None:
                 st = sess.get_checkin_status()
                 if not st.get("today_checked_in"):
                     r = sess.claim_daily_checkin()
+                    result["checkin_credits"] = r.get("credit") or 0
                     log.info("wb_login: 收尾-签到 id=%s ok=%s credit=%s",
                              account_id, r.get("ok"), r.get("credit"))
                 acc.auth_json = sess.updated_json()
                 db.commit()
         except Exception as e:
+            db.rollback()
+            result["errors"].append("签到失败")
             log.warning("wb_login: 收尾-签到失败 id=%s: %s", account_id, e)
 
         # ---- 3) 成长任务（含自动领奖）----
@@ -524,10 +558,15 @@ def _run_post_login_automation(account_id: int, name: str) -> None:
             rows = r.get("results") or []
             if rows:
                 first = rows[0]
+                result["growth_credits"] = first.get("credit") or 0
+                if not first.get("ok") or first.get("budget_exceeded") or first.get("claim_failed"):
+                    result["errors"].append("部分成长任务未完成或奖励未领取")
                 log.info("wb_login: 收尾-成长任务 id=%s 任务数=%s 领取积分=%s 能量=%s",
                          account_id, len(first.get("tasks") or []),
                          first.get("credit"), first.get("energy"))
         except Exception as e:
+            db.rollback()
+            result["errors"].append("成长任务失败")
             log.warning("wb_login: 收尾-成长任务失败 id=%s: %s", account_id, e)
 
         # ---- 4) 再刷一次余额，把上面领到的积分反映出来 ----
@@ -536,6 +575,11 @@ def _run_post_login_automation(account_id: int, name: str) -> None:
                 bal = sess.fetch_balance()
                 acc.balance_total = int(bal.get("total", 0) or 0)
                 acc.balance_remain = int(bal.get("remain", 0) or 0)
+                from admin.routers.accounts import _sync_credit_snapshot
+                try:
+                    _sync_credit_snapshot(acc, sess.fetch_credit_details())
+                except Exception:
+                    result["errors"].append("积分到期快照刷新失败")
                 acc.auth_json = sess.updated_json()
             acc.last_sync_at = datetime.utcnow()
             db.commit()
@@ -543,44 +587,29 @@ def _run_post_login_automation(account_id: int, name: str) -> None:
                      account_id, _t.time() - _t0,
                      acc.balance_remain, acc.balance_total)
         except Exception as e:
+            db.rollback()
+            result["errors"].append("余额刷新失败")
             log.warning("wb_login: 收尾-最终刷新余额失败 id=%s: %s", account_id, e)
     except Exception:
+        db.rollback()
+        result["errors"].append("自动任务异常")
         log.exception("wb_login: 登录后收尾异常 id=%s（不影响登录结果）", account_id)
     finally:
         db.close()
-
-
-def _post_login_worker(account_id: int, name: str) -> None:
-    """收尾线程的包装：结束后归还并发名额。"""
-    global _post_login_active
-    try:
-        _run_post_login_automation(account_id, name)
-    finally:
-        with _post_login_lock:
-            _post_login_active = max(0, _post_login_active - 1)
+    return result
 
 
 def _schedule_post_login_automation(account_id: int, name: str) -> None:
-    """把收尾工作丢进后台线程（不阻塞登录响应，且并发受限）。
-
-    拿不到名额就**跳过**（不是排队）：账号已经入库、能正常用，
-    只是这次不自动做任务 —— 等每天的定时任务兜底即可。
-    排队反而会积压出一堆待跑线程，得不偿失。
-    """
-    global _post_login_active
+    """Persist and queue onboarding without blocking the login response."""
+    from admin.post_login import enqueue_resources
+    enqueue_resources(account_id)
     if not POST_LOGIN_AUTOMATION:
         return
-    with _post_login_lock:
-        if _post_login_active >= MAX_POST_LOGIN_WORKERS:
-            logging.getLogger("admin.wb_login_router").info(
-                "wb_login: 收尾线程已满(%d)，跳过 id=%s（账号已入库，"
-                "将由每日定时任务兜底）", _post_login_active, account_id)
-            return
-        _post_login_active += 1
-    threading.Thread(target=_post_login_worker,
-                     args=(account_id, name),
-                     name="wb-post-login-%s" % account_id,
-                     daemon=True).start()
+    try:
+        from admin.post_login import enqueue
+        enqueue(account_id, name)
+    except Exception:
+        _logger.exception("登录后任务提交失败 account_id=%s（不影响入库）", account_id)
 
 
 # ---------------------------------------------------------------------------
@@ -636,20 +665,7 @@ def join_send(body: JoinIn, request: Request):
     """公开：发短信验证码。"""
     ip = get_client_ip(request.headers.get("x-forwarded-for"),
                        request.client.host if request.client else None)
-    mobile = wb_login.normalize_mobile(body.mobile)
-    _check_sms_quota(ip, mobile)
-    try:
-        sess = wb_login.get_session(body.sid)
-        with _upstream_slot("send"):
-            out = wb_login.send_sms(sess, body.mobile)
-    except wb_login.WbLoginError as e:
-        _refund_sms_quota(ip, mobile)
-        raise _fail(e, 502)
-    except HTTPException:
-        # 忙 -> 归还配额（其实没发出去），503 透给前端
-        _refund_sms_quota(ip, mobile)
-        raise
-    return {"ok": True, "expires_in": out.get("expires_in", 60)}
+    return _send_guarded(body, ip)
 
 
 @public_router.post("/api/join/verify")

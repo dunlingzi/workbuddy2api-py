@@ -12,9 +12,12 @@ Anthropic Messages API 参考：https://docs.anthropic.com/en/docs/messages
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from typing import Any
+
+_logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # ID 生成
@@ -94,18 +97,23 @@ def anthropic_request_to_chat(body: dict) -> dict:
     #   - thinking.type == "disabled" → 显式关闭
     #   - thinking.type == "enabled"  → 有档位则用档位，否则给默认 high
     # （实测 high 是 deepseek 系上游的默认档，且必然开启思维链）
+    output_config = body.get("output_config")
+    effort_hint = output_config.get("effort") if isinstance(output_config, dict) else None
+    effort_hint = effort_hint.strip() if isinstance(effort_hint, str) else ""
     thinking = body.get("thinking")
     if isinstance(thinking, dict):
         ttype = str(thinking.get("type") or "").strip().lower()
         if ttype == "disabled":
             chat["thinking"] = {"type": "disabled"}
-        elif ttype == "enabled":
+        elif ttype in ("enabled", "adaptive"):
             effort = thinking.get("effort")
+            if not isinstance(effort, str) or not effort.strip():
+                effort = effort_hint
             if not (isinstance(effort, str) and effort.strip()):
                 effort = "high"
             chat.setdefault("reasoning_effort", effort.strip())
-    elif isinstance(thinking, str) and thinking.strip().lower() == "enabled":
-        chat.setdefault("reasoning_effort", "high")
+    elif isinstance(thinking, str) and thinking.strip().lower() in ("enabled", "adaptive"):
+        chat.setdefault("reasoning_effort", effort_hint or "high")
 
     return chat
 
@@ -163,9 +171,14 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     blocks = content
 
     # 检查是否包含 tool_result（role=user 时）
+    #
+    # OpenAI/上游要求：assistant.tool_calls 之后必须**紧接**对应的 role:tool。
+    # 因此 tool_result 必须先输出；user 文本/图片只能排在 tool 结果之后，
+    # 绝不能 insert 到最前——否则会切断配对，上游报 11148。
     if role == "user":
-        result: list[dict] = []
-        parts: list[dict] = []  # OpenAI content parts（text + image_url）
+        tool_msgs: list[dict] = []
+        content_parts: list[dict] = []
+        has_images = False
         for block in blocks:
             if not isinstance(block, dict):
                 continue
@@ -173,41 +186,41 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
             if bt == "text":
                 t = block.get("text", "")
                 if t:
-                    parts.append({"type": "text", "text": t})
+                    content_parts.append({"type": "text", "text": t})
             elif bt == "image":
                 part = _image_block_to_part(block)
                 if part:
-                    parts.append(part)
+                    content_parts.append(part)
+                    has_images = True
             elif bt == "tool_result":
-                # tool_result → 独立的 tool 消息
-                tc_id = block.get("tool_use_id", "")
-                output = block.get("content", "")
-                tool_images: list[dict] = []
-                if isinstance(output, list):
-                    texts = []
-                    for b in output:
-                        if not isinstance(b, dict):
-                            continue
-                        if b.get("type") == "text":
-                            texts.append(b.get("text", ""))
-                        elif b.get("type") == "image":
-                            # OpenAI 的 tool 消息只收纯文本，图片挪进 user 消息
+                # tool_result → 独立的 tool 消息（必须紧随 assistant.tool_calls）
+                tc_id = block.get("tool_use_id") or ""
+                if not tc_id:
+                    # 空 id 无法与 tool_use 配对，上送必触发 11148；直接丢弃
+                    _logger.debug("drop tool_result with empty tool_use_id")
+                    continue
+                raw = block.get("content", "")
+                # OpenAI 的 tool 消息只收纯文本：内嵌图片先摘出来，挪进紧随
+                # 其后的 user 消息（否则只能被序列化成 JSON 文本，图片就丢了）。
+                if isinstance(raw, list):
+                    text_blocks = []
+                    for b in raw:
+                        if isinstance(b, dict) and b.get("type") == "image":
                             p = _image_block_to_part(b)
                             if p:
-                                tool_images.append(p)
-                    output = "".join(texts)
-                result.append({"role": "tool", "tool_call_id": tc_id, "content": output})
-                parts.extend(tool_images)
-        if parts:
-            # 纯文本保持 string content；带图片时用 parts 数组。
-            # 注意：user 内容必须放在 tool 消息**之后** —— OpenAI 协议要求
-            # tool 结果紧跟 assistant 的 tool_calls，中间插入 user 消息会被
-            # 上游判为 11148 "tool calls and tool results do not match"。
-            if all(p.get("type") == "text" for p in parts):
-                user_content: Any = "".join(p["text"] for p in parts)
-            else:
-                user_content = parts
-            result.append({"role": "user", "content": user_content})
+                                content_parts.append(p)
+                                has_images = True
+                        else:
+                            text_blocks.append(b)
+                    raw = text_blocks
+                output = _tool_result_to_text(raw)
+                if block.get("is_error"):
+                    output = f"Error: {output}" if output else "Error: tool execution failed"
+                tool_msgs.append({"role": "tool", "tool_call_id": tc_id, "content": output})
+        result = list(tool_msgs)
+        if content_parts:
+            content = content_parts if has_images else "".join(part["text"] for part in content_parts)
+            result.append({"role": "user", "content": content})
         return result
 
     # assistant 角色
@@ -221,8 +234,9 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
             if bt == "text":
                 text_parts.append(block.get("text", ""))
             elif bt == "tool_use":
+                # 键缺失或值为 null/"" 都要生成新 id，保证与 tool_result 可配对
                 tc = {
-                    "id": block.get("id", _rand_id("call_")),
+                    "id": block.get("id") or _rand_id("call_"),
                     "type": "function",
                     "function": {
                         "name": block.get("name", ""),
@@ -242,6 +256,34 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     # 其他角色：尝试提取文本
     text = _extract_blocks_text(blocks)
     return [{"role": role, "content": text}] if text else []
+
+
+def _tool_result_to_text(output) -> str:
+    """把 Anthropic tool_result.content 转成纯文本。
+
+    - str → 原样
+    - list → 拼接 text 块；非 text 块序列化为短 JSON，避免静默丢成空串
+    - 其它/None → 空串
+    """
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if not isinstance(output, list):
+        return str(output)
+    parts: list[str] = []
+    for b in output:
+        if not isinstance(b, dict):
+            parts.append(str(b))
+            continue
+        if b.get("type") == "text":
+            parts.append(b.get("text", "") or "")
+        else:
+            try:
+                parts.append(json.dumps(b, ensure_ascii=False)[:500])
+            except Exception:
+                parts.append(f"<{b.get('type') or 'block'}>")
+    return "".join(parts)
 
 
 def _extract_blocks_text(blocks: list) -> str:

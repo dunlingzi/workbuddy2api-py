@@ -25,6 +25,8 @@ from admin.security import (
 )
 from admin.gateway_limits import GatewayAdmissionMiddleware
 from admin.routers import releases
+from admin.routers import growth_center
+from admin.routers import benefits
 
 logger = logging.getLogger("admin.server")
 
@@ -140,6 +142,8 @@ app.include_router(groups.router)
 app.include_router(stats.router)
 app.include_router(credits.router)
 app.include_router(growth.router)
+app.include_router(growth_center.router)
+app.include_router(benefits.router)
 if os.getenv("WORKBUDDY_ANDROID") != "1":
     from admin.routers import app_source, client_profile
     app.include_router(client_profile.router)
@@ -164,6 +168,19 @@ def _startup():
         wb_login.start_gc_thread()
     except Exception:
         logger.exception("手机号登录会话回收线程启动失败（不影响其它功能）")
+
+    # 预热 Turing Shield 设备指纹 token（X-Device-Token）。
+    # 不预热的话，第一个请求会拿到 None（后台线程还没算完），
+    # 被上游判为「非官方客户端」→ 11128，还会触发负缓存，后续 5 分钟全部失败。
+    try:
+        from admin.turing_token import get_device_token
+        tok = get_device_token(force=True)
+        if tok:
+            logger.info("Turing 设备指纹预热成功（X-Device-Token 就绪）")
+        else:
+            logger.warning("Turing 设备指纹预热失败，X-Device-Token 为空")
+    except Exception:
+        logger.warning("Turing 设备指纹预热异常（不影响其它功能）")
 
     # 未配置登录凭据时给出醒目告警：此时后台登录一律 503，不会退化成空口令
     if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
@@ -241,6 +258,11 @@ def _startup():
     if db_ok:
         from admin.scheduler import start_scheduler
         start_scheduler()
+        try:
+            from admin.post_login import resume
+            resume()
+        except Exception:
+            logger.exception("恢复登录后自动任务失败（不影响服务启动）")
 
     # 预热设备风控 token：桌面端不存在时也会填上负缓存，
     # 避免每个请求都在事件循环里同步 fork 一次 node 造成阻塞。

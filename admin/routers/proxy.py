@@ -119,10 +119,12 @@ except Exception:  # pragma: no cover - 降级分支
 # （典型报错 400 code=11128 "Illegal API invocation from an unapproved channel"）。
 try:
     from desensitize import desensitize_body
+    from desensitize import _PATTERN as _SENSITIVE_PATTERN
     _DESENSITIZE_AVAILABLE = True
 except Exception:  # pragma: no cover - 降级分支
     _DESENSITIZE_AVAILABLE = False
     desensitize_body = None
+    _SENSITIVE_PATTERN = None
 
 
 def _cleanup_orphan_tools(chat_body: dict) -> int:
@@ -161,7 +163,20 @@ def _desensitize_chat_body(chat_body: dict) -> dict:
     误判成敏感内容并整条拒绝（典型 11128 "unapproved channel"）。
     /v1/messages 早就做了这一步；/v1/chat/completions、/v1/responses 若不同步，
     就会出现「CC 能用、OpenAI 反代发不出去」。
+
+    另外上游渠道校验把 **role=developer 本身**判为非官方客户端特征——实测
+    developer + 任何内容都 11128，同内容改 system 立即通过（官方客户端从不发
+    developer）。所以先把 developer 无条件归并为 system（独立于脱敏开关），
+    顺带让这些消息进入 system 角色的脱敏管道。DeepSeek Harness 就是以
+    developer 角色发全部系统提示的，这一步是它能用的前提。
     """
+    msgs = chat_body.get("messages")
+    if isinstance(msgs, list) and any(
+            isinstance(m, dict) and m.get("role") == "developer" for m in msgs):
+        chat_body = {**chat_body, "messages": [
+            {**m, "role": "system"} if isinstance(m, dict) and m.get("role") == "developer" else m
+            for m in msgs
+        ]}
     if not (_DESENSITIZE_AVAILABLE and settings.ANTHROPIC_DESENSITIZE):
         return chat_body
     try:
@@ -549,6 +564,11 @@ _SESSION_DEAD_MARKERS = ["Offline user session not found", "12153", "session not
 #: 注：14015/14016 **不在**上游 `isQuotaExhaustedError` 集合里，语义是「授权态问题」
 #: 而非「额度用完」，所以走 account_fault（30 分钟冷却）而不是 hard_credit（额度限制）。
 _ACCOUNT_FAULT_CODES = ("11140", "11142", "14017", "14015", "14016")
+#: 11128「illegal api invocation from an unapproved channel」：上游按**出口渠道 /
+#: 客户端身份**拦的，与账号本身无关。实测（本机 2 号池）连续命中会让两个号在同一
+#: 分钟内被逐个连败降权 → 池子归零，之后每个请求 50ms 直接 503 no_account
+#: （账号调用尝试 0 次）。所以它既不进账号连败，也不做账号级冷却。
+_CHANNEL_BLOCK_CODES = ("11128",)
 _ACCOUNT_FAULT_MARKERS = ("request illegal from an unapproved channel",
                           "trial version is not yet activated",
                           "trial not activated",
@@ -664,6 +684,10 @@ _UPSTREAM_INTERNAL_MARKERS = (
 _RETRYABLE_KINDS = frozenset({
     "hard_credit", "session_dead", "soft_rate", "model_rate", "model_block",
     "account_fault", "not_found", "server", "waf", "upstream_internal",
+    # 渠道被拦是**出口级**的、且实测是间歇性的（同一模型 5 次里 1 次成功）：
+    # 换到另一个号仍有机会成功，所以按可重试处理（不换号的代价是直接把这个
+    # 400 抛给客户端）。它不参与账号连败计数，所以轮转不会把池子摘空。
+    "channel_block",
 })
 
 #: 模型级错误里，「该账号对该模型限流」换号可解（6004，账号各自的额度）；
@@ -930,15 +954,22 @@ _EXHAUSTION_HINTS = {
     "not_found": "上游返回 404，模型或接口不存在",
     "transport": "与上游的网络连接异常",
     "no_account": "号池里没有可用账号（余额或状态均不满足）",
+    "channel_block": "上游按渠道/出口拦截了请求（11128 unapproved channel），与账号本身无关",
 }
 
 
 def _exhaustion_message(kind: str, last_msg: str, tried_accounts: int,
-                        tried_models: int, upstream_status: int = 0) -> str:
-    """Present gateway interpretation, client explanation and upstream evidence."""
+                        tried_models: int, upstream_status: int = 0,
+                        detail: str = "") -> str:
+    """Present gateway interpretation, client explanation and upstream evidence.
+
+    `detail` 只在选号阶段就没选出候选账号（尝试 0 次）时由调用方传入，
+    用来把**真实原因**（全禁用 / 余额为 0 / 全在临时限流或连败降权）写进报文 ——
+    否则客户端只会看到静态的「余额或状态均不满足」，排障方向直接被带偏。
+    """
     hint = _EXHAUSTION_HINTS.get(kind or "", "未知错误")
     tried = f"账号调用尝试 {tried_accounts} 次 / 候选模型 {tried_models} 个"
-    base = f"本网关判断：{hint}；{tried}"
+    base = f"本网关判断：{hint}" + (f"；具体原因：{detail}" if detail else "") + f"；{tried}"
     if not last_msg and not upstream_status:
         return base + '；本次没有取得上游错误响应。'
     info = upstream_errors.error_info(last_msg, upstream_status)
@@ -1015,6 +1046,12 @@ def _classify_error(status: int, body: str) -> str:
     # Official 5.8.1 classifier: model_service/model_behavior_error, not IP WAF.
     if code == "11141":
         return "model_behavior"
+    # 3b. 11128「非法渠道调用」：出口/渠道级拦截，与账号无关 —— 既不计账号连败、
+    #     也不做账号级冷却，只换号重试（见 _apply_account_policy 的 channel_block
+    #     分支）。必须排在所有账号级判定之前，否则会被当成账号故障/客户端错误，
+    #     前者给 30 分钟账号冷却、后者直接不重试，两种处置都不对。
+    if code in _CHANNEL_BLOCK_CODES or "unapproved channel" in body_l:
+        return "channel_block"
     if status == 403:
         for m in _ACCOUNT_FAULT_MARKERS:
             if m in body_l:
@@ -1311,6 +1348,13 @@ def _apply_account_policy(db: Session, acc: Account, kind: str, status: int,
         # Request/model policy rejection must not cool or degrade the entire account.
         acc.last_err_at = now
         acc.last_err_msg = (msg or "model behavior policy")[:255]
+    elif kind == "channel_block":
+        # 渠道被拦是**出口级**问题，不是账号的错：只留证据，不动
+        # err_count / consecutive_fails / 任何冷却 —— 否则每 5 次就把一个好号
+        # 降权 5 分钟，两个号的池子会在同一分钟内被摘空（实测：连续 4 次
+        # 503 no_account，账号调用尝试 0 次）。
+        acc.last_err_at = now
+        acc.last_err_msg = (msg or "upstream channel blocked")[:255]
     elif kind == "server" or status >= 500:
         # HTTP 5xx：熔断（指数退避），不再用「累计 5 次固定 10 分钟」——
         # 固定时长对持续坏的号太短（10 分钟后又被选中再失败），对偶发又太长。
@@ -2479,12 +2523,76 @@ async def chat_completions(
                             extra["X-Machine-ID"] = backend.stable_device_id(acc_i.uid, "machine")
                             extra["X-Session-ID"] = backend.stable_device_id(acc_i.uid, "session")
                         headers_i = await _blocking_call(_headers_for_attempt, sess_i, extra)
+                        _dt = headers_i.get("X-Device-Token", "")
+                        _logger.info("[forward-chat] POST %s | acc=%s | X-Device-Token=%s | body_len=%d",
+                                     url, acc_i.uid[:12] if acc_i.uid else "?",
+                                     ("OK(" + str(len(_dt)) + "ch)") if _dt else "MISSING",
+                                     len(json.dumps(body, ensure_ascii=False)))
                         try:
                             async with client.stream("POST", url, headers=headers_i, json=body) as r:
                                 if r.status_code >= 400:
                                     detail = await r.aread()
                                     text = detail[:65536].decode(errors="ignore") if isinstance(detail, bytes) else str(detail)[:65536]
                                     kind = _classify_error(r.status_code, text)
+                                    if kind == "channel_block":
+                                        # 只记请求**形状**与上游回执，不落用户正文（隐私）。
+                                        # 11128 在 chat 路径反复出现时，用它对比「同号同模型
+                                        # 此刻走 /v1/responses 是否能过」来区分内容触发 vs 渠道触发。
+                                        _sys = body.get("system")
+                                        _logger.warning(
+                                            "[forward-chat] 11128 diag | model=%s msgs=%d system=%s tools=%d stream=%s tool_choice=%s | upstream=%.200s",
+                                            body.get("model"),
+                                            len(body.get("messages") or []),
+                                            (f"str:{len(_sys)}" if isinstance(_sys, str)
+                                             else f"{type(_sys).__name__}:{len(_sys)}" if isinstance(_sys, list)
+                                             else "absent"),
+                                            len(body.get("tools") or []),
+                                            body.get("stream"), body.get("tool_choice"),
+                                            text[:200])
+                                        # 命中词统计：只记 desensitize 词表里**命中了哪些词、各几次**，
+                                        # 不记原文 —— 用它直接定位 DeepSeek Harness 等未知 harness
+                                        # 的触发词，好扩展压缩/词表。
+                                        if _SENSITIVE_PATTERN is not None:
+                                            try:
+                                                from collections import Counter
+                                                _hits = Counter(
+                                                    w.lower() for w in
+                                                    _SENSITIVE_PATTERN.findall(json.dumps(body, ensure_ascii=False)))
+                                                if _hits:
+                                                    _top = ", ".join(f"{w}x{n}" for w, n in _hits.most_common(12))
+                                                    _logger.warning("[forward-chat] 11128 keyword-hits | %s", _top)
+                                                else:
+                                                    _logger.warning("[forward-chat] 11128 keyword-hits | (词表无命中 —— 触发词不在已知词表内)")
+                                            except Exception:
+                                                pass
+                                        # 临时排障开关（默认关）：ADMIN_CHANNEL_BLOCK_DUMP=1 时把
+                                        # 各消息/工具描述的**前缀**落日志。词表外触发词（如中文
+                                        # 合规词）只有看到正文片段才能定位；定位后即可移除该开关。
+                                        if os.getenv("ADMIN_CHANNEL_BLOCK_DUMP") == "1":
+                                            try:
+                                                for _i, _m in enumerate(body.get("messages") or []):
+                                                    if not isinstance(_m, dict):
+                                                        continue
+                                                    _c = _m.get("content")
+                                                    if isinstance(_c, str):
+                                                        _head = _c[:160]
+                                                    elif _c:
+                                                        _head = json.dumps(_c, ensure_ascii=False)[:160]
+                                                    else:
+                                                        _head = ""
+                                                    _logger.warning("[forward-chat] 11128 dump msg[%d] role=%s len=%s | %s",
+                                                                    _i, _m.get("role"),
+                                                                    len(_c) if isinstance(_c, str) else "-",
+                                                                    _head.replace("\n", "\\n"))
+                                                for _i, _t in enumerate((body.get("tools") or [])[:10]):
+                                                    _fn = _t.get("function") or {} if isinstance(_t, dict) else {}
+                                                    _desc = _fn.get("description") or ""
+                                                    if _desc:
+                                                        _logger.warning("[forward-chat] 11128 dump tool[%d] %s | %s",
+                                                                        _i, _fn.get("name"),
+                                                                        str(_desc)[:120].replace("\n", "\\n"))
+                                            except Exception:
+                                                pass
                                     await _blocking_call(_apply_account_policy, db2, acc_i, kind, r.status_code, text,
                                                           model=m, reset_at=_error_reset_at(getattr(r, "headers", None), text))
                                     await _blocking_call(_maybe_degrade, db2, acc_i)
@@ -2782,7 +2890,15 @@ async def chat_completions(
             await _blocking_call(_record_usage, key.id, 0, final_model, 0.0, None,
                           reasoning_effort=_reasoning_effort(payload), client_ip=_client_ip(request), use_case="chat-completion", seq=seq, latency_ms=latency_ms,
                           error_kind=err_kind)
-            err_msg = _exhaustion_message(err_kind, last_err_msg, tried_accounts, tried_models_n, last_err_status)
+            # 尝试 0 次 = 选号阶段就没选出候选账号。这里必须把**真实原因**带上
+            # （全禁用 / 余额为 0 / 全在临时限流或连败降权），否则客户端只看得到
+            # 静态的「余额或状态均不满足」，排障会被带偏到「换号 / 充值」上去。
+            detail = ""
+            if err_kind == "no_account" and not tried_accounts:
+                detail = await _blocking_call(_no_account_reason, db2,
+                                              getattr(key, "account_id", None), key.id)
+            err_msg = _exhaustion_message(err_kind, last_err_msg, tried_accounts, tried_models_n,
+                                          last_err_status, detail)
             err_obj = {"error": {"message": err_msg, "type": "server_error", "code": "service_unavailable",
                                  **_failure_evidence(err_kind, last_err_msg, last_err_status)}}
             if aggregate:

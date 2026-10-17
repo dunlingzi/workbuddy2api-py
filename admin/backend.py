@@ -13,7 +13,7 @@ from datetime import datetime
 
 import httpx
 
-from converter import BACKEND, CredentialError, CredentialManager  # 复用既有后端鉴权 / 刷新 / 模型 / 额度逻辑
+from converter import BACKEND, CredentialManager  # 复用既有后端鉴权 / 刷新 / 模型 / 额度逻辑
 
 #: 项目根加入 sys.path，便于导入根目录的 wb_install（与 converter 同级）。
 #: admin 包可能在 `uvicorn admin.server:app` 下被导入，此时根目录不一定在

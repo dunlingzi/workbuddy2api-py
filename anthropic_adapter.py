@@ -134,6 +134,9 @@ def _extract_system_text(system) -> str:
 def _image_block_to_part(block: dict) -> dict | None:
     """Anthropic image block → OpenAI image_url 内容部件。无法转换返回 None。
 
+    宽松版：只用于 tool_result 内嵌图（一张坏图不该把整条请求打挂）。
+    顶层 user 内容的 image 走 _image_block_to_chat_part（严格，非法 source 报错）。
+
     Anthropic: {"type": "image", "source": {"type": "base64",
                "media_type": "image/png", "data": "<base64>"}}
                或 source.type == "url"
@@ -152,6 +155,30 @@ def _image_block_to_part(block: dict) -> dict | None:
         if url:
             return {"type": "image_url", "image_url": {"url": url}}
     return None
+
+
+def _image_block_to_chat_part(block: dict) -> dict:
+    """Preserve Anthropic base64/URL images; reject invalid sources instead of losing them."""
+    source = block.get("source")
+    if not isinstance(source, dict):
+        raise ValueError("image.source must be an object")
+    source_type = source.get("type")
+    if source_type == "base64":
+        media = source.get("media_type") or "image/png"
+        data = source.get("data")
+        if not isinstance(media, str) or not media.strip().startswith("image/"):
+            raise ValueError("image.source.media_type must be an image MIME type")
+        if not isinstance(data, str) or not data.strip():
+            raise ValueError("image.source.data must be a nonempty base64 string")
+        url = f"data:{media.strip()};base64,{data.strip()}"
+    elif source_type == "url":
+        url = source.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise ValueError("image.source.url must be a nonempty string")
+        url = url.strip()
+    else:
+        raise ValueError("image.source.type must be base64 or url")
+    return {"type": "image_url", "image_url": {"url": url}}
 
 
 def _convert_anthropic_message(msg: dict) -> list[dict]:
@@ -188,10 +215,8 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
                 if t:
                     content_parts.append({"type": "text", "text": t})
             elif bt == "image":
-                part = _image_block_to_part(block)
-                if part:
-                    content_parts.append(part)
-                    has_images = True
+                content_parts.append(_image_block_to_chat_part(block))
+                has_images = True
             elif bt == "tool_result":
                 # tool_result → 独立的 tool 消息（必须紧随 assistant.tool_calls）
                 tc_id = block.get("tool_use_id") or ""
@@ -202,6 +227,7 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
                 raw = block.get("content", "")
                 # OpenAI 的 tool 消息只收纯文本：内嵌图片先摘出来，挪进紧随
                 # 其后的 user 消息（否则只能被序列化成 JSON 文本，图片就丢了）。
+                extracted = False
                 if isinstance(raw, list):
                     text_blocks = []
                     for b in raw:
@@ -210,12 +236,17 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
                             if p:
                                 content_parts.append(p)
                                 has_images = True
-                        else:
-                            text_blocks.append(b)
+                                extracted = True
+                                continue
+                            # 转不了的图不静默丢掉：交给 _tool_result_to_text 序列化成短 JSON
+                        text_blocks.append(b)
                     raw = text_blocks
                 output = _tool_result_to_text(raw)
                 if block.get("is_error"):
                     output = f"Error: {output}" if output else "Error: tool execution failed"
+                elif not output and extracted:
+                    # 图片已挪进 user 消息，但 tool 消息不能是空的（空 tool content 会被上游拒）
+                    output = "(image attached)"
                 tool_msgs.append({"role": "tool", "tool_call_id": tc_id, "content": output})
         result = list(tool_msgs)
         if content_parts:

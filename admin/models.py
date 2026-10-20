@@ -36,6 +36,7 @@ class Account(Base):
     last_err_at = Column(DateTime, nullable=True)
     last_err_msg = Column(String(255), default="")
     last_upstream_error = Column(Text, default="")
+    max_in_flight = Column(Integer, nullable=True, default=None)  # null=global, 0=unlimited
     selection_priority = Column(Integer, nullable=True, default=None)
     last_picked_at = Column(DateTime, nullable=True)  # 最近一次被选中（仅观测；防撞号窗口已移入进程内存）
     # 熔断：连续失败达阈值后指数退避，封顶 breaker_cooldown_max。
@@ -45,7 +46,7 @@ class Account(Base):
     # 连续 12153「session dead」计数：达到阈值才禁用。
     # 一次就禁用等于误杀 —— 该错误在真实环境会被临时性触发（上游抖动/并发刷新）。
     session_dead_fails = Column(Integer, default=0)
-    # 连败降权（「不知道原因的失败」兜底：未知 4xx 与传输层抖动）：
+    # 连败降权（传输层抖动与上游内部故障）：
     # 带权威分类的错误各有自己的惩罚，不喂这个计数器，避免重复计罚。
     consecutive_fails = Column(Integer, default=0)
     degrade_until = Column(DateTime, nullable=True)
@@ -115,7 +116,7 @@ class ApiKey(Base):
     key_full = Column(String(2048), default="")  # 完整密钥（仅管理后台查看用，base64 编码存储）
     credit_limit = Column(Float, default=0)  # 限额（credits）；unlimited=True 时忽略
     credit_used = Column(Float, default=0)
-    unlimited = Column(Integer, default=0)  # 0/1
+    unlimited = Column(Integer, default=1)  # New keys default to unlimited; existing limits are preserved.
     # 该 Key 并发上限：NULL=跟随全局 ADMIN_GATEWAY_MAX_CONCURRENT；0=不限；N=最多 N 路在途
     # 注意：这是准入层限制，与账号层 ADMIN_POOL_MAX_IN_FLIGHT（防单号雪崩）相互独立。
     max_concurrent = Column(Integer, nullable=True, default=None)
@@ -198,6 +199,7 @@ class UsageLog(Base):
     ttfb_ms = Column(Integer, nullable=True, default=None)
     latency_ms = Column(Integer, nullable=True, default=None)
     error_kind = Column(String(32), default="")  # hard_credit | soft_rate | server | not_found | session_dead | transport | client | success
+    diagnostic_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -227,6 +229,20 @@ class GrowthPlanRecord(Base):
     ok = Column(Integer, default=1)
     credit = Column(Integer, default=0)
     result_json = Column(Text, default="{}")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class CreditEvent(Base):
+    """Confirmed rewards and observed balance changes are separate ledgers."""
+    __tablename__ = "credit_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_key = Column(String(160), nullable=False, unique=True)
+    account_id = Column(Integer, nullable=False, index=True)
+    account_name = Column(String(120), default="")
+    kind = Column(String(24), nullable=False, index=True)
+    source = Column(String(120), default="", index=True)
+    delta = Column(Integer, nullable=False)
+    balance_after = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 

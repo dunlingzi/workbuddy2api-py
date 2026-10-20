@@ -761,6 +761,8 @@
         <button class="side-item" data-tab="client"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 0 1 16 0m-13 5v-5a5 5 0 0 1 10 0v3m-7 5v-8a2 2 0 0 1 4 0v5m-1 5a12 12 0 0 0 4-4M3 16v-1"/></svg> 客户端参数</button>
         <button class="side-item" data-tab="sync"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18a5 5 0 1 1 1-10 6 6 0 0 1 11 1 4 4 0 0 1 0 8m-6 4V11m-4 4 4-4 4 4"/></svg> 同步设置</button>
         <button class="side-item" data-tab="settings"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m10 3-1 3-3 1-2 3 2 2v3l2 2 3-1 2 2 3-1 1-3 3-1 1-3-3-2V7l-3-2-2 1Z"/><circle cx="12" cy="12" r="3"/></svg> 设置</button>
+        <button class="side-item" data-tab="journal"><i class="fa-solid fa-list"></i> 积分流水</button>
+        <button class="side-item" data-tab="maintenance"><i class="fa-solid fa-cloud-arrow-down"></i> 更新与备份</button>
         <!-- 抽屉内的退出入口（移动端顶栏放不下，收进菜单更自然） -->
         <button class="side-item side-item-quit" onclick="logout()"><i class="fa-solid fa-right-from-bracket"></i> 退出登录</button>
         <div class="theme-controls mobile-theme-controls" role="group" aria-label="主题">
@@ -1009,7 +1011,7 @@
       <p class="text-xs text-slate-400 mb-3">统计平台全部 Key 的用量：请求数、Token、积分与平均耗时。数据来自本地 usage_logs，随请求实时累计。</p>
 
       <!-- 筛选：按 Key / 模型 / 端点。筛选后所有图与卡片同步变化。 -->
-      <div class="card p-3 mb-4">
+      <div class="card p-3 mb-4 usage-filter-card">
         <div class="flex flex-wrap gap-2 items-end">
           <div class="flex-1 min-w-[150px]">
             <div class="text-[11px] text-slate-400 mb-1">按 Key</div>
@@ -1026,6 +1028,12 @@
           <button onclick="resetUsageFilters()" class="text-sm px-3 py-1.5 rounded-lg border hover:bg-slate-50 whitespace-nowrap">
             <i class="fa-solid fa-filter-circle-xmark mr-1"></i> 清除筛选
           </button>
+        </div>
+        <div class="usage-date-filters">
+          <div class="journal-field"><label for="usageStartButton">开始日期</label><input id="usageStart" type="date" aria-label="使用记录开始日期" data-date-picker /></div>
+          <div class="journal-field"><label for="usageEndButton">结束日期</label><input id="usageEnd" type="date" aria-label="使用记录结束日期" data-date-picker /></div>
+          <button class="console-btn primary" onclick="applyUsageDates()">查询</button>
+          <span class="usage-date-note">按本地日期查询，包含结束当天；留空使用上方时间范围。</span>
         </div>
         <div id="usageFilterHint" class="text-[11px] text-slate-400 mt-2 hidden"></div>
       </div>
@@ -1096,8 +1104,9 @@
           <p>每次代理调用的原始记录。<b>按账号查询</b>支持名称模糊匹配（会列出全部匹配的账号，
              不再只取第一个），并可按账号汇总看谁在用、用了多少。</p>
         </div>
-        <div class="flex flex-wrap gap-2">
+        <div id="logActions" class="flex flex-wrap gap-2">
           <button onclick="exportLogs()" class="px-3 py-1.5 rounded-lg border text-sm" title="导出当前筛选结果为 CSV"><i class="fa-solid fa-file-csv mr-1"></i> 导出</button>
+          <button onclick="exportLogs(true)" class="px-3 py-1.5 rounded-lg border text-sm" title="含脱敏诊断，最多导出最近 1000 条">导出诊断</button>
           <button onclick="loadLogs(1)" class="px-3 py-1.5 rounded-lg border text-sm" title="刷新"><i class="fa-solid fa-rotate mr-1"></i> 刷新</button>
         </div>
       </div>
@@ -1121,6 +1130,8 @@
             <div class="text-[11px] mb-1" style="color:var(--fg-muted)">Key</div>
             <input id="logKey" aria-label="Key" placeholder="全部 Key" class="w-full border rounded-lg px-3 py-2 text-sm" />
           </div>
+          <div class="fld-140"><div class="text-[11px] mb-1" style="color:var(--fg-muted)">调用结果</div>
+            <select id="logResult" aria-label="调用结果" onchange="loadLogs(1)" class="w-full border rounded-lg px-3 py-2 text-sm"><option value="">全部结果</option><option value="error">仅错误</option><option value="success">仅成功</option></select></div>
           <div class="fld-110">
             <div class="text-[11px] mb-1" style="color:var(--fg-muted)">客户端 IP</div>
             <input id="logIp" placeholder="全部" class="w-full border rounded-lg px-3 py-2 text-sm" />
@@ -1129,11 +1140,11 @@
         <div class="flex flex-wrap gap-2 items-end mt-2">
           <div class="fld-140">
             <div class="text-[11px] mb-1" style="color:var(--fg-muted)">起始日期</div>
-            <input id="logStart" type="date" class="w-full border rounded-lg px-2 py-2 text-sm" />
+            <input id="logStart" type="date" aria-label="用量日志起始日期" data-date-picker class="w-full border rounded-lg px-2 py-2 text-sm" />
           </div>
           <div class="fld-140">
             <div class="text-[11px] mb-1" style="color:var(--fg-muted)">结束日期</div>
-            <input id="logEnd" type="date" class="w-full border rounded-lg px-2 py-2 text-sm" />
+            <input id="logEnd" type="date" aria-label="用量日志结束日期" data-date-picker class="w-full border rounded-lg px-2 py-2 text-sm" />
           </div>
           <button onclick="loadLogs(1)" class="px-3 py-2 rounded-lg btn-primary text-sm"><i class="fa-solid fa-filter mr-1"></i> 查询</button>
           <button onclick="resetLogFilters()" class="px-3 py-2 rounded-lg border text-sm"><i class="fa-solid fa-filter-circle-xmark mr-1"></i> 清除</button>
@@ -1144,6 +1155,7 @@
             <input type="checkbox" id="logFastMode" onchange="loadLogs(1)" /> 快速翻页（不统计总数）
           </label>
         </div>
+        <div id="logStats" class="text-sm mt-3" aria-live="polite"></div>
         <div id="logFilterHint" class="text-[11px] mt-2 hidden"></div>
       </div>
 
@@ -1334,6 +1346,26 @@
       </div>
     </section>
 
+    <section id="panel-journal" class="hidden">
+      <div class="page-head"><div><h1>积分流水</h1><p>查看奖励与余额变动，追溯每一笔积分。</p></div></div>
+      <div class="card journal-card">
+        <div class="journal-filters">
+          <div class="journal-field"><span id="journalAccountLabel">账号</span><select id="journalAccount" aria-label="账号"><option value="">全部账号</option></select></div>
+          <div class="journal-field"><span>来源</span><select id="journalSource" aria-label="来源"><option value="">全部来源</option></select></div>
+          <div class="journal-field"><span>记录类型</span><select id="journalKind" aria-label="记录类型"><option value="">全部类型</option><option value="confirmed">确认奖励</option><option value="observed">余额观察</option></select></div>
+          <div class="journal-field"><span>开始时间</span><input id="journalStart" type="datetime-local" aria-label="开始时间" /></div>
+          <div class="journal-field"><span>结束时间</span><input id="journalEnd" type="datetime-local" aria-label="结束时间" /></div>
+          <div class="journal-actions"><button class="console-btn primary" onclick="WBReview.loadJournal(1)">筛选 / 刷新</button><button class="console-btn quiet" onclick="WBReview.resetJournal()">重置</button></div>
+        </div>
+        <div class="journal-notice">确认奖励与余额观察分别记录，不能相加统计；历史未保存的来源和余额显示为未记录。</div>
+        <div class="overflow-x-auto"><table class="tbl journal-table"><thead><tr><th>时间</th><th>账号</th><th>类型</th><th>来源</th><th class="journal-number">积分变化</th><th class="journal-number">本次观察余额</th></tr></thead><tbody id="journalBody"></tbody></table></div>
+        <div class="journal-footer"><p id="journalHint" role="status"></p><div class="journal-pagination"><button id="journalPrev" class="console-btn" onclick="WBReview.journalPage(-1)">上一页</button><span id="journalPage"></span><button id="journalNext" class="console-btn" onclick="WBReview.journalPage(1)">下一页</button></div></div>
+      </div>
+    </section>
+    <section id="panel-maintenance" class="hidden">
+      <div class="page-head"><div><h1>更新与备份</h1><p>检查正式版本、备份数据库，并按部署方式执行升级。</p></div><button class="console-btn" onclick="WBReview.loadUpdate()">检查更新</button></div>
+      <div id="maintenanceInfo" aria-live="polite">点击检查更新获取版本信息。</div>
+    </section>
     <!-- 设置面板 -->
     <section id="panel-settings" class="hidden">
       <h2 class="font-semibold mb-3">管理员设置</h2>
@@ -1532,7 +1564,7 @@ function uiSelectToggle(id, ev) {
   el.classList.toggle("open", !wasOpen);
 }
 
-function uiSelectPick(id, value, ev) {
+function uiSelectPick(id, value, ev, notify = true) {
   if (ev) ev.stopPropagation();
   const st = _uiSelectMap.get(id);
   const el = $("#" + id);
@@ -1550,15 +1582,15 @@ function uiSelectPick(id, value, ev) {
     if (!on && old) old.remove();
   });
   el.classList.remove("open");
-  if (st.onChange) st.onChange(value, o);
+  if (notify && st.onChange) st.onChange(value, o);
 }
 
 function uiSelectValue(id) {
   const st = _uiSelectMap.get(id);
   return st ? st.value : "";
 }
-function uiSelectSet(id, value) {
-  uiSelectPick(id, String(value));
+function uiSelectSet(id, value, notify = true) {
+  uiSelectPick(id, String(value), null, notify);
 }
 const $ = (s) => document.querySelector(s);
 const TOKEN_KEY = "wb_admin_token";
@@ -1733,7 +1765,7 @@ function enterApp() {
 
 // Tabs
 // 面板清单与默认面板：默认面板不写进 URL（保持地址栏干净）。
-const TABS = ["accounts","credits","usage","keys","models","groups","schedules","growth","logs","client","sync","settings"];
+const TABS = ["journal","maintenance","accounts","credits","usage","keys","models","groups","schedules","growth","logs","client","sync","settings"];
 const TAB_DEFAULT = "accounts";
 
 /** 从地址栏读当前应显示的面板；非法/缺失一律回落到默认面板。 */
@@ -1756,6 +1788,8 @@ function _tabFromUrl() {
 function activateTab(name, opts) {
   if (!TABS.includes(name)) name = TAB_DEFAULT;
   document.documentElement.dataset.activeTab = name;
+  window.WBDateTimePicker?.close();
+  window.WBFilterCombobox?.close();
   // 侧栏导航：active 由 .side-item.active 表达
   document.querySelectorAll(".side-item").forEach(x => {
     x.classList.toggle("active", x.dataset.tab === name);
@@ -1780,6 +1814,8 @@ function activateTab(name, opts) {
   }
 
   // 切到这几个面板时按需拉数据（图表/分组列表/客户端参数不必在首屏就请求）
+  if (name === "journal") window.WBReview?.loadJournal(1);
+  if (name === "maintenance") window.WBReview?.loadUpdate();
   if (name === "groups") loadGroups();
   if (name === "usage") loadUsageStats();
   if (name === "credits") loadCreditStats();
@@ -2225,6 +2261,8 @@ function accRow(a) {
   const soon = Number(a.credits_expiring_soon || 0);
   // 图标操作按钮抽成数组：顺序/配色一处可调，比 9 个 button 平铺更好维护
   const ops = [
+    [`WBReview.accountLimit(${a.id})`, "fa-sliders", "text-indigo-600", "账号并发上限"],
+    [`openReauthAccount(${a.id})`, "fa-key", "text-emerald-600", "重新登录"],
     [`growthTasks(${a.id},'${esc(a.name||'')}')`, "fa-seedling", "text-emerald-600", "成长任务"],
     [`catTravel(${a.id})`, "fa-cat", "text-pink-600", "猫猫旅行"],
     [`viewCreditDetails(${a.id},'${esc(a.name||'')}')`, "fa-list-ul", "text-amber-600", "积分明细（逐包到期日）"],
@@ -3652,8 +3690,11 @@ function plSave() {
     codeSent:!$('#plStep2')?.classList.contains('hidden')});
 }
 
-async function openPhoneLogin(){
-  if ($('#plMobile') && $('#plStep3').classList.contains('hidden')) {
+let _plAccountId = null;
+async function openPhoneLogin(accountId = null){
+  const sameTarget = _plAccountId === accountId;
+  _plAccountId = accountId;
+  if (sameTarget && $('#plMobile') && $('#plStep3').classList.contains('hidden')) {
     $('#modal').classList.remove('hidden'); $('#modal').classList.add('flex');
     $('#modal').dataset.closeOnly = '1'; return;
   }
@@ -3661,6 +3702,7 @@ async function openPhoneLogin(){
   _plSid = saved.sid || '';
   openModal(`
     <h3 class="font-bold mb-1"><i class="fa-solid fa-mobile-screen-button mr-1 text-emerald-600"></i> 手机号登录</h3>
+    <p class="text-xs text-slate-500 mb-2">${accountId ? `正在重新登录账号 #${Number(accountId)}，只接受原身份，保留历史与绑定。` : ""}</p>
     <p class="text-xs text-slate-500 mb-4">输入手机号获取验证码。登录成功后系统会自动完成授权，把凭证加入账号池；<b>无需安装客户端</b>。</p>
 
     <div id="plStep1">
@@ -3824,7 +3866,7 @@ async function plVerify(){
   try {
     const r = await api("/api/login/verify", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sid: _plSid, code })
+      body: JSON.stringify({ sid: _plSid, code, account_id: _plAccountId })
     });
     const { ok, data } = await safeJson(r);
     if(ok){
@@ -3856,10 +3898,10 @@ async function plVerify(){
 function openUpload(){
   openModal(`
     <h3 class="font-bold mb-3"><i class="fa-solid fa-file-import mr-1"></i> 批量上传账号</h3>
-    <p class="text-xs text-slate-500 mb-2">粘贴多个 WorkBuddy 登录态（.info 原文）。支持：①一个 JSON 数组；②每行一个 JSON 对象。也可选择本地 .info 文件。</p>
+    <p class="text-xs text-slate-500 mb-2">粘贴 WorkBuddy 登录态，支持单个 JSON、JSON 数组或每行一个 JSON。也可选择多个凭证文件：新版加密、旧版明文及 .info.bak-时间戳备份均支持，按文件内容验证。</p>
     <p class="text-xs text-amber-600 mb-2"><i class="fa-solid fa-shield-halved mr-1"></i>每条都会调真实上游接口验证是否可用，<b>伪造的凭证会被拒收</b>（因此上传略慢，属正常）。</p>
     <textarea id="upText" class="w-full border rounded-lg p-2 text-xs h-40 font-mono" placeholder='{"auth":{...},"account":{...}}'></textarea>
-    <input id="upFile" type="file" accept=".info,.json" multiple class="upload-file-input" />
+    <input id="upFile" type="file" multiple class="upload-file-input" aria-label="选择账号凭证或备份文件" />
     <div id="upResult" class="upload-result hidden" role="status" aria-live="polite"></div>
     <div class="upload-footer">
       <button id="upSubmit" type="button" onclick="submitUpload()" class="console-btn primary upload-submit"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12m-4-4 4 4 4-4M4 16v4h16v-4"/></svg><span>确认导入</span></button>
@@ -4061,6 +4103,34 @@ async function exportAcc(id, name) {
   } catch(error) { toast(error.message || '文件未保存', 'err'); }
 }
 
+function openReauthAccount(id) {
+  openModal(`<h3 class="font-bold mb-2">重新登录 · 账号 #${Number(id)}</h3>
+    <p class="text-sm mb-4">验证通过后更新原账号凭证，保留排序、Key 绑定与历史记录。模型日限不会因重登而重置。</p>
+    <button class="console-btn mb-3" onclick="openPhoneLogin(${Number(id)})">手机号验证码登录</button>
+    <label class="block text-sm mb-2">上传凭证或备份文件 <input id="reauthFile" type="file" /></label>
+    <p class="text-xs text-slate-500 mb-2">支持新版加密、旧版明文及 .info.bak-时间戳备份；将验证凭证是否仍可用、是否属于原账号。</p>
+    <textarea id="reauthJson" class="w-full border rounded-lg p-2 text-xs h-40 font-mono" placeholder="或粘贴最新账号凭证"></textarea>
+    <div class="flex gap-2 mt-3"><button id="reauthSubmit" class="console-btn" onclick="submitReauthAccount(${Number(id)})">验证并更新原账号</button><button class="console-btn quiet" onclick="closeModal()">取消</button></div>`);
+  $('#reauthFile').onchange = async e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (file.size > 1024 * 1024) { toast('凭证文件过大', 'err'); return; }
+    $('#reauthJson').value = await file.text();
+  };
+}
+async function submitReauthAccount(id) {
+  const button = $('#reauthSubmit');
+  const auth_json = $('#reauthJson').value.trim();
+  if (!auth_json) { toast('请上传或粘贴最新凭证', 'err'); return; }
+  button.disabled = true;
+  try {
+    const {ok, data} = await safeJson(await api('/api/accounts/' + Number(id) + '/reauth', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({auth_json})}));
+    if (!ok) { toast(typeof data.detail === 'string' ? data.detail : data.detail?.message || '验证失败，原凭证未修改', 'err'); return; }
+    closeModal(); toast(data.message); loadAccounts();
+  } catch (_) { toast('更新失败，请检查连接后重试', 'err'); }
+  finally { button.disabled = false; }
+}
+
 function openAddAccount(){
   openModal(`
     <h3 class="font-bold mb-3"><i class="fa-solid fa-plus mr-1"></i> 添加单个账号</h3>
@@ -4211,8 +4281,8 @@ async function openAddKey(){
   openModal(`
     <h3 class="font-bold mb-3"><i class="fa-solid fa-key mr-1"></i> 创建 API Key</h3>
     <input id="kName" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" placeholder="名称（可选）" />
-    <label class="flex items-center gap-2 text-sm mb-2"><input id="kUnlimited" type="checkbox" /> 不限额（∞）</label>
-    <input id="kLimit" type="number" min="0" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" placeholder="积分限额（credits）" />
+    <label class="flex items-center gap-2 text-sm mb-2"><input id="kUnlimited" type="checkbox" checked onchange="if(this.checked) document.getElementById('kLimit').value=''" /> 不限额（∞，默认）</label>
+    <input id="kLimit" type="number" min="0" class="w-full border rounded-lg px-3 py-2 mb-2 text-sm" placeholder="留空不限额；填写 0 表示零额度" oninput="document.getElementById('kUnlimited').checked=this.value.trim()===''" />
     <input id="kMaxConcurrent" type="number" min="0" class="w-full border rounded-lg px-3 py-2 mb-1 text-sm" placeholder="并发上限（空=全局，0=不限）" title="key 并发≠账号在途上限（ADMIN_POOL_MAX_IN_FLIGHT）" />
     <p class="text-[11px] text-slate-400 mb-2">并发：空=全局默认；0=不限；N=最多 N 路。与账号在途上限相互独立。</p>
     <div class="mb-2">
@@ -4232,7 +4302,7 @@ async function openAddKey(){
     </div>`);
 }
 async function submitAddKey(){
-  const unlimited = $("#kUnlimited").checked;
+  const unlimited = $("#kUnlimited").checked || $("#kLimit").value.trim() === "";
   const mcRaw = $("#kMaxConcurrent").value;
   const body = { name:$("#kName").value||"", unlimited, credit_limit: Number($("#kLimit").value||0), note:$("#kNote").value||"", group_id: Number(uiSelectValue("kGroup")||0), account_id: Number(uiSelectValue("kAccount")||0),
     max_concurrent: mcRaw === "" ? null : Number(mcRaw) };
@@ -4307,8 +4377,8 @@ async function editKey(id){
 
     ${keyAccountSelect("ekAccount", accountOptions, k.account_id)}
     <label class="block text-xs text-slate-500 mb-1">积分限额（credits）</label>
-    <input id="ekLimit" type="number" min="0" class="w-full border rounded-lg px-3 py-2 mb-3 text-sm" value="${k.unlimited ? 0 : k.credit_limit}" placeholder="积分限额" />
-    <label class="flex items-center gap-2 text-sm mb-1"><input id="ekUnlimited" type="checkbox" ${k.unlimited ? "checked" : ""} /> 不限额（∞）</label>
+    <input id="ekLimit" type="number" min="0" class="w-full border rounded-lg px-3 py-2 mb-3 text-sm" value="${k.unlimited ? "" : k.credit_limit}" placeholder="留空不限额；填写 0 表示零额度" oninput="document.getElementById('ekUnlimited').checked=this.value.trim()===''" />
+    <label class="flex items-center gap-2 text-sm mb-1"><input id="ekUnlimited" type="checkbox" onchange="if(this.checked) document.getElementById('ekLimit').value=''" ${k.unlimited ? "checked" : ""} /> 不限额（∞）</label>
     <label class="flex items-center gap-2 text-sm mb-2"><input id="ekReset" type="checkbox" /> 重置已用额度（当前 ${k.credit_used}）</label>
 
     <label class="block text-xs text-slate-500 mb-1">并发上限</label>
@@ -4328,7 +4398,7 @@ async function submitEditKey(id){
     group_id: Number(uiSelectValue("ekGroup") || 0),
     account_id: Number(uiSelectValue("ekAccount") || 0),
     credit_limit: Number($("#ekLimit").value || 0),
-    unlimited: $("#ekUnlimited").checked,
+    unlimited: $("#ekUnlimited").checked || $("#ekLimit").value.trim() === "",
     max_concurrent: mcRaw === "" ? null : Number(mcRaw),
     reset_used: $("#ekReset").checked,
   };
@@ -5376,6 +5446,7 @@ function _logQuery() {
   const fast = $("#logFastMode") ? $("#logFastMode").checked : false;
 
   const p = new URLSearchParams({ page: _logPage, page_size: _logPageSize });
+  if ($("#logResult")?.value) p.set("result", $("#logResult").value);
   if (accountId) p.set("account_id", accountId);
   if (model) p.set("model", model);
   if (key) p.set("key", key);
@@ -5436,6 +5507,9 @@ async function loadLogs(page) {
     return;
   }
   fillLogFilterOptions();
+  const stats = d.stats;
+  $('#logStats').textContent = stats ? `当前筛选 · 共 ${stats.total} 次 · 成功 ${stats.success} 次 · 错误 ${stats.error} 次` : '快速翻页未统计总数';
+  if (_logPage === 1) loadLogSummary();
 
   const fast = $("#logFastMode") ? $("#logFastMode").checked : false;
   const total = d.total;              // null = 本次未统计
@@ -5498,8 +5572,42 @@ function logRow(l) {
     <td class="text-xs text-right">${credHtml}</td>
     <td>${latencyHtml}</td>
     <td class="text-xs" style="color:var(--fg-muted)" title="透传给上游的 X-Agent-Purpose">${esc((l.use_case||'—').slice(0,14))}</td>
-    <td>${statusHtml}</td>
+    <td><button type="button" class="console-btn quiet" onclick="openUsageDetail(${Number(l.id)})" title="查看调用详情">${statusHtml} 详情</button></td>
   </tr>`;
+}
+
+function renderMobileRuntime(d) {
+  if (!d || (!d.android_runtime && !d.event_loop_stalls?.length && !(d.event_loop_lag_ms >= 1000))) return '';
+  const a = d.android_runtime;
+  return `<div class="limit-note"><p><b>手机服务运行状态</b></p>
+    <p>事件循环最大延迟：${((d.event_loop_lag_ms || 0)/1000).toFixed(3)} 秒${d.event_loop_lag_ms >= 1000 ? '（本地处理曾停顿，不能仅凭此判定为上游超时）' : ''}</p>
+    ${a ? `<p>${esc(a.manufacturer || '')} ${esc(a.device_model || '')} · Android SDK ${Number(a.android_sdk) || '—'} · 服务代次 ${Number(a.service_revision) || '—'}</p>
+    <p>电池优化：${a.battery_unrestricted ? '已允许不受限制' : '未豁免'} · 后台限制：${a.background_restricted ? '已限制' : '系统未报告限制'} · 屏幕：${a.interactive ? '亮屏' : '息屏'}</p>
+    <p>省电模式：${a.power_save ? '开启' : '关闭'} · 系统休眠：${a.device_idle ? '是' : '否'} · CPU 保活：${a.wake_lock ? '持有' : '未持有'}</p>
+    <p>网络：${a.wifi ? 'Wi-Fi' : a.cellular ? '移动网络' : a.network_available ? '其他网络' : '未连接'} · 系统联网校验：${a.network_validated ? '通过' : '未通过'}</p>` : ''}
+    ${(d.event_loop_stalls || []).map(s => `<details><summary>停顿采样：${(Number(s.paused_ms)/1000).toFixed(3)} 秒 · 期间进程 CPU ${(Number(s.process_cpu_ms)/1000).toFixed(3)} 秒</summary><pre class="whitespace-pre-wrap break-all">${esc((s.stack || []).join('\n'))}</pre></details>`).join('')}</div>`;
+}
+
+async function openUsageDetail(id) {
+  try {
+    const response = await api('/api/logs/' + Number(id));
+    const {ok, data} = await safeJson(response);
+    if (!ok) { toast(data.detail || '读取详情失败', 'err'); return; }
+    const d = data.diagnostic;
+    const json = d ? JSON.stringify(d, null, 2) : '这条历史记录没有保存请求详情，无法恢复当时的上游响应。';
+    openModal(`<h3 class="font-semibold text-lg mb-3">调用详情 · ${esc(data.model)}</h3>
+      <p>账号：${esc(data.account_name)} · 网关分类：${esc(data.error_kind || '未记录')}</p>
+      ${d?.gateway_error ? `<div class="limit-note"><p>网关本地拒绝（未请求上游）：</p><pre class="whitespace-pre-wrap break-all">${esc(d.gateway_error)}</pre></div>` : ""}
+      ${d?.diagnostic_truncated ? '<p class="limit-note">诊断内容过长，部分消息已截断。</p>' : ''}
+      ${renderMobileRuntime(d)}
+      ${d ? `<p>请求编号：${esc(d.id || '—')} · 网关 HTTP：${Number(d.status) || '记账时尚未发送响应头'}</p><p>网关处理结果：${Number(d.gateway_result_status) || '—'}${d.status === 200 && d.error_kind && d.error_kind !== 'success' ? '（响应头已发送 200，随后处理失败）' : ''}</p>
+      ${(d.account_policy_events || []).map(e => `<div class="limit-note"><p>账号 #${Number(e.account_id)} · ${esc(e.model || '')} · 网关分类：${esc(e.kind)}</p><p>上游 HTTP：${Number(e.http_status) || '未收到 HTTP 响应'} · 上游 code：${esc(e.upstream_code ?? '未提供')}</p><p>上游 msg：${esc(e.upstream_message ?? '未提供')}</p>${e.message_truncated || e.raw_truncated ? '<p>消息过长，以下内容已截断。</p>' : ''}${e.upstream_raw != null ? `<p>上游响应原文（凭据脱敏）：</p><pre class="whitespace-pre-wrap break-all">${esc(e.upstream_raw)}</pre>` : ''}</div>`).join('')}
+      ${(d.network_errors || []).map(e => `<div class="limit-note"><p>本地网络异常 · 账号 #${Number(e.account_id) || '—'} · ${esc(e.phase || '')}</p><pre class="whitespace-pre-wrap break-all">${esc(e.message)}</pre><p>${e.http_status ? '已收到上游 HTTP ' + Number(e.http_status) + '，随后传输中断。' : '未收到响应，没有可展示的上游 HTTP / code / msg。'}</p></div>`).join('')}
+      ${d.connection_recoveries ? `<p>已尝试新连接恢复：${Number(d.connection_recoveries)} 次</p>` : ''}` : ''}
+      <details class="mt-3"><summary>完整诊断 JSON</summary><pre class="whitespace-pre-wrap break-all text-xs">${esc(json)}</pre></details>
+      <textarea id="usageDiagnosticText" hidden></textarea><div class="flex gap-2 mt-3"><button class="console-btn quiet" onclick="copyText('#usageDiagnosticText')">复制详情</button><button class="console-btn quiet" onclick="closeModal()">关闭</button></div>`, 'max-w-3xl');
+    document.getElementById('usageDiagnosticText').value = JSON.stringify(data, null, 2);
+  } catch (error) { toast('读取详情失败', 'err'); }
 }
 
 /** 按账号汇总表：回答「这个号用了多少」，不用翻几十页去数。 */
@@ -5511,11 +5619,14 @@ async function loadLogSummary() {
   const accountId = uiSelectValue("logAccountSel") || "";
   box.innerHTML = `<div class="fs-12 py-3" style="color:var(--fg-subtle)">加载中...</div>`;
   try {
-    const r = await api(`/api/logs/summary?days=${days}` + (accountId ? `&account_id=${accountId}` : ""));
+    const filters = new URLSearchParams(_logQuery().qs);
+    ['page','page_size','before_id','with_total'].forEach(k => filters.delete(k));
+    filters.set('days', '0');
+    const r = await api('/api/logs/summary?' + filters);
     const { ok, data } = await safeJson(r);
     if (!ok) { box.innerHTML = `<div class="empty">加载失败：${esc(data.detail || "")}</div>`; return; }
     const items = data.items || [];
-    if (hint) hint.textContent = `近 ${data.range_days} 天 · ${items.length} 个账号 · 合计 ${fmtCredit(data.total_credits)} 积分`;
+    if (hint) hint.textContent = `当前筛选 · ${data.account_count} 个账号 · 成功 ${data.ok_requests} / 错误 ${data.failed_requests} · ${fmtCredit(data.total_credits)} 积分${data.unattributed_requests ? ` · ${data.unattributed_requests} 次未记录账号 / 未选号` : ""}`;
     if (!items.length) { box.innerHTML = `<div class="empty">该时间范围内没有账号产生请求。</div>`; return; }
     const maxC = Math.max(1, ...items.map(x => x.credits));
     box.innerHTML = `<table class="tbl" style="min-width:820px">
@@ -5543,8 +5654,8 @@ function resetLogFilters() {
   WBFilterCombobox.close();
   uiSelectSet("logAccountSel", "");
   uiSelectSet("logDaysSel", "1");
-  ["logModel", "logKey", "logIp", "logStart", "logEnd"].forEach(id => {
-    const el = document.getElementById(id); if (el) el.value = "";
+  ["logModel", "logKey", "logIp", "logStart", "logEnd", "logResult"].forEach(id => {
+    const el = document.getElementById(id); if (el) { el.value = ""; el.dispatchEvent(new Event('change', {bubbles:true})); }
   });
   const f = $("#logFastMode"); if (f) f.checked = false;
   _logBeforeId = null;
@@ -5562,7 +5673,7 @@ function fillLogFilterOptions(){
   WBFilterCombobox.attach('logKey', _keyData.map(k => k.name));
 }
 
-async function exportLogs(){
+async function exportLogs(diagnostics = false){
   const days = parseInt(uiSelectValue("logDaysSel") || "1", 10) || 0;
   const accountId = uiSelectValue("logAccountSel") || "";
   const model = ($("#logModel") ? $("#logModel").value : "").trim();
@@ -5579,6 +5690,8 @@ async function exportLogs(){
   else if(days > 0) params.push("start=" + encodeURIComponent(
     new Date(Date.now() - days*86400000).toISOString().slice(0,19).replace("T"," ")));
   if(end) params.push("end=" + encodeURIComponent(end + " 23:59:59"));
+  if ($('#logResult')?.value) params.push('result=' + encodeURIComponent($('#logResult').value));
+  if (diagnostics) params.push('diagnostics=true&limit=1000');
   const qs = params.length ? ("?" + params.join("&")) : "";
   toast("正在导出 CSV...", "ok");
   try {
@@ -5878,6 +5991,7 @@ function trendChart(rows) {
  * Key/模型/端点三个筛选下拉的选项来自「窗口内真实出现过的值」。 */
 let _usageSelReady = false;
 let _usageFilterReady = false;
+let _usageLoadGeneration = 0;
 // 筛选下拉的选项缓存。声明必须在使用它的 _usageQuery / loadUsageFilterOptions
 // **之前**：虽是顶层 let（会被提升到 TDZ），但函数可能在任何位置被调用，
 // 声明靠后容易踩「Cannot access before initialization」。放前面最省心。
@@ -5898,8 +6012,14 @@ function initUsageSelects() {
       { value: "14", label: "近 14 天" },
       { value: "30", label: "近 30 天" },
       { value: "90", label: "近 90 天" },
+      { value: "custom", label: "自定义日期" },
     ],
-    onChange: () => { loadUsageFilterOptions(); loadUsageStats(); },
+    onChange: async value => {
+      if (value === "custom") return;
+      for (const id of ["usageStart", "usageEnd"]) { $("#" + id).value = ""; window.WBDateTimePicker?.sync(id); }
+      _usageFilterReady = false;
+      await loadUsageFilterOptions(); loadUsageStats();
+    },
   });
   const gBox = $("#usageGrainSel");
   if (gBox) gBox.outerHTML = uiSelectHTML("usageGrainSel", {
@@ -5910,19 +6030,48 @@ function initUsageSelects() {
     ],
     onChange: () => loadUsageStats(),
   });
+  for (const id of ["usageStart", "usageEnd"]) {
+    $("#" + id).addEventListener("change", () => {
+      _usageFilterReady = false;
+      if ($("#usageStart").value || $("#usageEnd").value) uiSelectSet("usageDaysSel", "custom");
+      else uiSelectSet("usageDaysSel", "1");
+    });
+  }
+}
+
+function _usageDatesValid() {
+  const start = $("#usageStart").value, end = $("#usageEnd").value;
+  return !start || !end || start <= end;
+}
+function _usageTimeParams() {
+  const start = $("#usageStart").value, end = $("#usageEnd").value;
+  const params = new URLSearchParams();
+  if (start || end) {
+    if (start) params.set("start", new Date(start + "T00:00:00").toISOString());
+    if (end) params.set("end", new Date(end + "T23:59:59.999").toISOString());
+  } else params.set("days", String(Number(uiSelectValue("usageDaysSel")) || 1));
+  return params;
+}
+async function applyUsageDates() {
+  if (!_usageDatesValid()) return toast("开始日期不能晚于结束日期", "err");
+  _usageFilterReady = false;
+  await loadUsageFilterOptions();
+  await loadUsageStats();
 }
 
 // 渲染 Key/模型/端点筛选下拉。
 // 选项只列窗口内真实出现过的值 —— 否则下拉里塞满从没用过的模型，
 // 选中后筛出空结果，用户会以为"功能坏了"。
 async function loadUsageFilterOptions() {
-  const days = uiSelectValue("usageDaysSel") || 1;
+  if (!_usageDatesValid()) return;
+  const windowQuery = _usageTimeParams().toString();
   let opts = { models: [], use_cases: [], keys: [] };
   try {
-    const r = await api(`/api/stats/usage/options?days=${days}`);
+    const r = await api('/api/stats/usage/options?' + windowQuery);
     const { ok, data } = await safeJson(r);
     if (ok) opts = data || opts;
   } catch (e) { /* 选项拉取失败不阻塞统计展示 */ }
+  if (windowQuery !== _usageTimeParams().toString()) return;
   _usageOpts = opts;
 
   // 保留当前选择；但若该值本次不在选项里（换了时间窗后消失），
@@ -5968,26 +6117,31 @@ async function loadUsageFilterOptions() {
 function resetUsageFilters() {
   // 必须走 uiSelectSet：下拉的真实状态在 _uiSelectMap 里，
   // 直接改 DOM 的 dataset 只会让标签变了、筛选值还在。
-  uiSelectSet("usageKeySel", "");
-  uiSelectSet("usageModelSel", "");
-  uiSelectSet("usageCaseSel", "");
+  uiSelectSet("usageKeySel", "", false);
+  uiSelectSet("usageModelSel", "", false);
+  uiSelectSet("usageCaseSel", "", false);
+  uiSelectSet("usageDaysSel", "1", false);
+  for (const id of ["usageStart", "usageEnd"]) { $("#" + id).value = ""; window.WBDateTimePicker?.sync(id); }
+  _usageFilterReady = false;
   loadUsageStats();
 }
 
 /* 当前筛选条件 -> query string，并生成一句人话提示 */
 function _usageQuery() {
-  const days = uiSelectValue("usageDaysSel") || 1;
   const grain = uiSelectValue("usageGrainSel") || "hour";
   const key = uiSelectValue("usageKeySel") || "";
   const model = uiSelectValue("usageModelSel") || "";
   const cs = uiSelectValue("usageCaseSel") || "";
-  const qs = new URLSearchParams({ days, granularity: grain });
+  const qs = _usageTimeParams();
+  qs.set("granularity", grain);
   if (key) qs.set("key_id", key);
   if (model) qs.set("model", model);
   if (cs) qs.set("use_case", cs);
 
   const keyName = ((_usageOpts.keys || []).find(k => String(k.id) === key) || {}).name || key;
   const conds = [];
+  const start = $("#usageStart").value, end = $("#usageEnd").value;
+  if (start || end) conds.push("日期=" + (start || "…") + " ~ " + (end || "…"));
   if (key) conds.push(`Key=${keyName}`);
   if (model) conds.push(`模型=${model}`);
   if (cs) conds.push(`端点=${cs}`);
@@ -6006,7 +6160,10 @@ function _usageEmpty(conds) {
 
 async function loadUsageStats() {
   initUsageSelects();
+  const generation = ++_usageLoadGeneration;
+  if (!_usageDatesValid()) return toast("开始日期不能晚于结束日期", "err");
   if (!_usageFilterReady) await loadUsageFilterOptions();
+  if (generation !== _usageLoadGeneration) return;
 
   const { qs, conds } = _usageQuery();
   const ov = $("#usageOverview");
@@ -6023,6 +6180,7 @@ async function loadUsageStats() {
   try {
     const r = await api(`/api/stats/usage?${qs}`);
     const { ok, data: d } = await safeJson(r);
+    if (generation !== _usageLoadGeneration) return;
     if (!ok) { if (ov) ov.innerHTML = `<div class="col-span-4 text-sm text-red-500">加载失败: ${esc(d.detail || "")}</div>`; return; }
 
     const o = d.overview || {};
@@ -6048,6 +6206,7 @@ async function loadUsageStats() {
     $("#usageEndpointChart").innerHTML = donutChart(d.by_endpoint, "credits");
     $("#usageTrendChart").innerHTML = trendChart(d.trend);
   } catch (e) {
+    if (generation !== _usageLoadGeneration) return;
     if (ov) ov.innerHTML = `<div class="col-span-4 text-sm text-red-500">加载异常: ${esc(e.message)}</div>`;
   }
 }
@@ -6129,6 +6288,8 @@ if (TOKEN && !new URLSearchParams(location.search).has("desktop")) {
 </script>
 <script src="/static/growth_center.js"></script>
 <script src="/static/benefits.js"></script>
+<script src="/static/date-time-picker.js"></script>
+<script src="/static/review-improvements.js"></script>
 <script src="/static/vendor/marked-12.0.2.min.js"></script>
 <script src="/static/vendor/dompurify-3.4.17.min.js"></script>
 <script src="/static/release-notes.js"></script>

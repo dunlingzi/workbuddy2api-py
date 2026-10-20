@@ -498,6 +498,7 @@ def list_accounts(_: bool = Depends(require_admin), db: Session = Depends(get_db
             "enterprise_id": a.enterprise_id,
             "domain": a.domain,
             "status": a.status,
+            "max_in_flight": a.max_in_flight,
             "bound_key_id": owners[a.id].id if owners.get(a.id) else None,
             "bound_key_name": owners[a.id].name if owners.get(a.id) else "",
             "balance_total": a.balance_total,
@@ -727,6 +728,43 @@ def add_account(body: AccountIn, _: bool = Depends(require_admin), db: Session =
     _post_login_automation(acc.id, acc.name or acc.uid)
     return {"id": acc.id, "name": acc.name, "ok": True, "duplicated": False,
             "verified": True, "balance_remain": acc.balance_remain}
+
+
+def _reauthenticate_account(db: Session, acc_id: int, credential: str,
+                          profile: dict, balance: dict) -> Account:
+    acc = db.query(Account).filter(Account.id == acc_id).with_for_update().first()
+    if acc is None:
+        raise HTTPException(404, "原账号不存在，请刷新列表")
+    old_uid = str(acc.uid or _uid_of(acc.auth_json) or "")
+    new_uid = str(profile.get("uid") or _uid_of(credential) or "")
+    if not old_uid or not new_uid or old_uid != new_uid:
+        raise HTTPException(409, "登录身份与原账号不一致，未替换凭证；请使用原账号重新登录")
+    _apply_meta(acc, credential, profile=profile, balance=balance)
+    acc.status = "active"
+    acc.session_dead_fails = 0
+    acc.consecutive_fails = 0
+    acc.breaker_fails = 0
+    acc.breaker_until = None
+    acc.degrade_until = None
+    # Logging in does not restore upstream quota or remove model daily limits.
+    if acc.cool_kind in ("session_dead", "transport", "upstream_5xx"):
+        acc.cool_kind = ""
+        acc.cool_until = None
+    acc.last_err_msg = ""
+    acc.last_err_at = None
+    acc.last_upstream_error = ""
+    return acc
+
+
+@router.post("/{acc_id}/reauth")
+def reauthenticate_account(acc_id: int, body: AccountIn,
+                           _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    credential = _decode_or_400(body.auth_json)
+    _reject_non_credential(credential)
+    profile, balance = _verify_credential_live_or_400(credential)
+    acc = _reauthenticate_account(db, acc_id, credential, profile, balance)
+    db.commit()
+    return {"ok": True, "id": acc.id, "message": "凭证已更新，原账号 ID、排序、Key 绑定及历史记录已保留"}
 
 
 @router.post("/batch")
@@ -1597,6 +1635,14 @@ def patch_account(
     acc = db.query(Account).filter(Account.id == acc_id).first()
     if not acc:
         raise HTTPException(status_code=404, detail="账号不存在")
+    if "max_in_flight" in body:
+        value = body["max_in_flight"]
+        if value is None or value == "":
+            acc.max_in_flight = None
+        elif type(value) is int and 0 <= value <= 2147483647:
+            acc.max_in_flight = value
+        else:
+            raise HTTPException(400, "并发上限必须是非负整数；留空跟随全局，0 表示不限")
     if "name" in body:
         acc.name = body["name"]
     if "status" in body and body["status"] in ("active", "disabled"):

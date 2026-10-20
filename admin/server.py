@@ -27,6 +27,8 @@ from admin.gateway_limits import GatewayAdmissionMiddleware
 from admin.routers import releases
 from admin.routers import growth_center
 from admin.routers import benefits
+from admin import credit_journal  # register transactional balance observations
+from admin.routers import maintenance
 
 logger = logging.getLogger("admin.server")
 
@@ -109,9 +111,8 @@ async def _security_headers(request: Request, call_next):
 
 app.add_middleware(GatewayAdmissionMiddleware)
 
-if os.getenv("WORKBUDDY_ANDROID") == "1":
-    from admin.request_metrics import TimingMiddleware
-    app.add_middleware(TimingMiddleware)
+from admin.request_metrics import TimingMiddleware
+app.add_middleware(TimingMiddleware)
 
 
 @app.on_event("startup")
@@ -141,6 +142,7 @@ app.include_router(logs.router)
 app.include_router(groups.router)
 app.include_router(stats.router)
 app.include_router(credits.router)
+app.include_router(maintenance.router)
 app.include_router(growth.router)
 app.include_router(growth_center.router)
 app.include_router(benefits.router)
@@ -409,6 +411,10 @@ def join_index():
     return FileResponse(STATIC_DIR / "join.html")
 
 
+import mimetypes
+# Windows registry MIME mappings can override JS/CSS and fail under nosniff.
+for _suffix, _mime in {".js": "application/javascript", ".css": "text/css", ".svg": "image/svg+xml"}.items():
+    mimetypes.add_type(_mime, _suffix)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # 内嵌 converter 网关到 /gw 前缀（单端口部署）。设置脱敏与日志路径以对齐独立运行时的行为。

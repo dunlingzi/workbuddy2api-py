@@ -3,6 +3,7 @@
 venv/
 env/
 node_modules/
+.omo/
 
 # ===== Python 缓存 =====
 __pycache__/
@@ -21,6 +22,7 @@ __pycache__/
 *.log
 logs/
 *.pid
+.turing_token_cache.json
 
 
 # ===== 压缩包备份 =====

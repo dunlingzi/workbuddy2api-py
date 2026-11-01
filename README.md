@@ -2,6 +2,8 @@
 
 把 WorkBuddy / CodeBuddy 登录态接入 OpenAI、Responses 和 Anthropic 兼容 API，提供多账号池、API Key 和自动化管理界面。
 
+## 本项目仅供学习，网关是可以检测出来的，违反workbuddy协议导致账号被封后果自负！
+
 项目包含两部分：**API 反代网关**负责协议转换、账号轮换和用量记账；**多账号管理与自动化平台**负责手机号登录、凭证导入、积分到期管理、签到、成长任务和宠物旅行。可在服务器部署，也可使用 Windows EXE 或 Android APK 独立运行。
 
 ## 项目运行截图

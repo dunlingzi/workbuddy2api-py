@@ -4,6 +4,8 @@
 
 ## 本项目仅供学习，网关是可以检测出来的，违反workbuddy协议导致账号被封后果自负！
 
+> 本仓库 fork 自上游 [DistPub/workbuddy2api](https://github.com/DistPub/workbuddy2api) 并在其基础上修改维护，与上游无官方关联，问题反馈请优先前往上游仓库。
+
 项目包含两部分：**API 反代网关**负责协议转换、账号轮换和用量记账；**多账号管理与自动化平台**负责手机号登录、凭证导入、积分到期管理、签到、成长任务和宠物旅行。可在服务器部署，也可使用 Windows EXE 或 Android APK 独立运行。
 
 ## 项目运行截图
@@ -612,6 +614,7 @@ CC Switch 中对应填写 Anthropic 服务地址、后台 API Key 和模型。�
 
 | 项目 | 作者 | 许可 | 参考内容 |
 | --- | --- | --- | --- |
+| [workbuddy2api](https://github.com/DistPub/workbuddy2api) | DistPub | MIT | 本仓库的上游项目（fork 来源），账号池与网关核心能力来源 |
 | [codebuddy2openai](https://github.com/HanHan666666/codebuddy2openai) | HanHan666666 | MIT | 从客户端登录态提供 OpenAI 兼容接口的思路 |
 | [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) | Sliverkiss | MIT | 多账号池、错误处置、会话粘性、限流与保活设计 |
 | [workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) | linguo2625469 | MIT | 可视化运维面板的信息架构与交互设计 |

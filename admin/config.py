@@ -198,6 +198,14 @@ class Settings:
     #: 保活/批量任务里账号之间的最小间隔（秒），避免批量请求被识别为机器行为。
     KEEPALIVE_ACCOUNT_GAP = float(os.getenv("ADMIN_KEEPALIVE_ACCOUNT_GAP", "0.8"))
 
+    # ---------- 封号自动复核（移植自 wb2api 1.16.0） ----------
+    #: 风控封号（11140 等 account_fault）自动复核与解封是否启用。
+    BAN_RECHECK_ENABLED = os.getenv("ADMIN_BAN_RECHECK_ENABLED", "1") != "0"
+    #: 同一账号两次复核的最小间隔（秒），默认 30 分钟；防滥用上游。
+    BAN_RECHECK_MIN_INTERVAL = int(os.getenv("ADMIN_BAN_RECHECK_MIN_INTERVAL", "1800"))
+    #: 连续仍封时的指数退避封顶（秒），默认 6 小时。
+    BAN_RECHECK_MAX_INTERVAL = int(os.getenv("ADMIN_BAN_RECHECK_MAX_INTERVAL", "21600"))
+
     # ---------- 超时（关键：流式绝不设总时长） ----------
     #: 连接超时（秒）：连不上就快速换号，不让用户干等。
     STREAM_CONNECT_TIMEOUT = float(os.getenv("ADMIN_STREAM_CONNECT_TIMEOUT", "15"))

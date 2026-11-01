@@ -205,6 +205,9 @@ def run_task(task: str, db, schedule: "Schedule | None" = None) -> dict:
         return run_growth_plan(db)
     if task == "keepalive_tokens":
         return run_keepalive_tokens(db)
+    if task == "ban_recheck":
+        from admin.ban_recheck import run_ban_recheck
+        return run_ban_recheck(db)
     return {"task": task, "error": "未知任务类型"}
 
 
@@ -806,6 +809,26 @@ def ensure_growth_plan_schedule(db):
         db.commit()
 
 
+def ensure_ban_recheck_schedule(db):
+    """补齐「风控封号复核」定时任务（幂等，移植自 wb2api 1.16.0）。
+
+    每 30 分钟一轮；真正的探测频率由 admin/ban_recheck.py 的退避控制
+    （每号 ≥ BAN_RECHECK_MIN_INTERVAL，持续仍封则指数退避）。
+    ADMIN_BAN_RECHECK_ENABLED=0 时禁用任务（保留后台手动触发能力）。
+    """
+    row = db.query(Schedule).filter(Schedule.task == "ban_recheck").first()
+    if not settings.BAN_RECHECK_ENABLED:
+        if row is not None and row.enabled:
+            row.enabled = 0
+            db.commit()
+        return
+    if row is None:
+        db.add(Schedule(name="风控封号复核与自动解封", task="ban_recheck",
+                        interval_minutes=30, enabled=1,
+                        next_run_at=datetime.utcnow() + timedelta(minutes=2)))
+        db.commit()
+
+
 def start_growth_plan(schedule, db):
     """独立后台线程执行，立即运行按钮和调度循环均无需等待整批账号。"""
     from admin.growth_plan import _Lease, run_growth_plan
@@ -1081,6 +1104,7 @@ def start_scheduler():
         ensure_keepalive_schedule(db)
         ensure_credit_schedule(db)
         ensure_growth_plan_schedule(db)
+        ensure_ban_recheck_schedule(db)
         from admin.benefits import ensure_schedule
         ensure_schedule(db)
         from admin.growth_center import import_last_run

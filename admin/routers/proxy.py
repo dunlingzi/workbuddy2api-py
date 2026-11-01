@@ -30,7 +30,8 @@ from admin.models import Account, AccountModelCooldown, ApiKey, ModelConfig, Usa
 from admin.routers.models import _is_model_allowed
 from admin.security import check_quota, get_key_row
 from admin.pool import POOL
-from upstream_compat import normalize_tool_choice, cleanup_orphan_tool_calls, validate_tool_pairing
+from upstream_compat import (normalize_tool_choice, cleanup_orphan_tool_calls,
+                             validate_tool_pairing, shield_harness_prompt)
 
 HTTP_LIMITS = backend.HTTP_LIMITS
 
@@ -177,6 +178,14 @@ def _desensitize_chat_body(chat_body: dict) -> dict:
             {**m, "role": "system"} if isinstance(m, dict) and m.get("role") == "developer" else m
             for m in msgs
         ]}
+    # 改写盾：把 DSH 出厂 prompt 按段改写为自有措辞，消掉 11128 模板指纹。
+    # 必须在压缩/脱敏之前跑——它匹配的是出厂 prompt 的原始字面。
+    try:
+        n_shield = shield_harness_prompt(chat_body)
+        if n_shield:
+            _logger.info("[harness-shield] 改写出厂 prompt %d 段", n_shield)
+    except Exception as e:
+        _logger.warning("[harness-shield] failed: %s", e)
     if not (_DESENSITIZE_AVAILABLE and settings.ANTHROPIC_DESENSITIZE):
         return chat_body
     try:
